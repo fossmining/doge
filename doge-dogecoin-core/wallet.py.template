@@ -120,6 +120,8 @@ def start_import(rpc, xpub_str, account_index, since_ts):
             xpub = wk.Xpub(xpub_str.strip())
         except ValueError as exc:
             raise WalletError("Invalid xpub: " + str(exc))
+        if not (0 <= int(account_index) < 0x80000000):
+            raise WalletError("Account number out of range")
         if xpub.depth != 3:
             raise WalletError(
                 "This key is at depth " + str(xpub.depth) + ", not an account key. "
@@ -136,18 +138,19 @@ def start_import(rpc, xpub_str, account_index, since_ts):
         rescan = bool(since_ts)
         timestamp = int(since_ts) if since_ts else "now"
         all_addrs = state["addresses"]["0"] + state["addresses"]["1"]
-        save_state(state)
         if not rescan:
             _import_addresses(rpc, all_addrs, timestamp, False)
+            save_state(state)
             return {"rescan": False}
         _rescan.update(running=True, started=time.time(), error=None)
 
     def job():
         try:
             _import_addresses(rpc, all_addrs, timestamp, True)
+            save_state(state)
             extend_gap(rpc)
         except Exception as exc:  # noqa: BLE001
-            _rescan["error"] = str(exc)
+            _rescan["error"] = "Import failed, account not linked: " + str(exc)
         finally:
             _rescan["running"] = False
 
@@ -266,17 +269,22 @@ def _history(rpc, state):
     rows = rpc("listtransactions", ["*", 200, 0, True])
     by_txid = {}
     for r in rows:
-        if r.get("address") not in amap or not r.get("involvesWatchonly", True):
+        cat = r.get("category")
+        if cat == "receive" and r.get("address") not in amap:
+            continue
+        if cat == "send" and not r.get("involvesWatchonly"):
+            continue  # a node-wallet spend, not this account's
+        if cat not in ("receive", "send"):
             continue
         t = by_txid.setdefault(r["txid"], {"txid": r["txid"], "time": r.get("time"), "confirmations": r.get("confirmations", 0),
                                            "received": Decimal(0), "sent": Decimal(0), "fee": Decimal(0)})
-        amt = Decimal(str(r.get("amount", 0)))
-        if r.get("category") == "receive":
+        amt = _q(r.get("amount", 0))
+        if cat == "receive":
             t["received"] += amt
-        elif r.get("category") == "send":
+        else:
             t["sent"] += -amt
             if r.get("fee") is not None:
-                t["fee"] = -Decimal(str(r["fee"]))
+                t["fee"] = -_q(r["fee"])
     out = []
     for t in sorted(by_txid.values(), key=lambda t: (t["time"] or 0), reverse=True):
         net = t["received"] - t["sent"]
@@ -330,7 +338,7 @@ def build(rpc, to_address, amount, fee_per_kb=None, subtract_fee=False, send_max
             raise WalletError("No Trezor account imported")
         if _rescan["running"]:
             raise WalletError("Rescan still running")
-    else:
+    elif source == "node":
         ns = node_status(rpc)
         if not ns.get("enabled"):
             raise WalletError("Node wallet mode is not enabled")
@@ -399,14 +407,18 @@ def build(rpc, to_address, amount, fee_per_kb=None, subtract_fee=False, send_max
     if fee > Decimal("100") and fee > amount:
         raise WalletError("Refusing an absurdly high fee (" + str(fee) + " DOGE)")
 
+    if source == "mydoge" and to_address == md["address"]:
+        raise WalletError("Sending to the MyDoge address itself would only pay a fee; nothing to do")
+    if source == "trezor" and to_address in _addr_map(state):
+        raise WalletError("Recipient is one of this account's own addresses; sending to yourself only pays a fee")
     outputs = [{"address": to_address, "amount": _koinu(amount), "script_type": "PAYTOADDRESS"}]
-    rpc_outputs = {to_address: float(_q(amount))}
+    rpc_outputs = {to_address: _s(amount)}
     change_info = None
     if change > 0 and source in ("node", "mydoge"):
         caddr = rpc("getrawchangeaddress") if source == "node" else md["address"]
         change_info = {"address": caddr, "index": None, "amount": _s(change)}
         outputs.append({"address": caddr, "amount": _koinu(change), "script_type": "PAYTOADDRESS"})
-        rpc_outputs[caddr] = float(_q(change))
+        rpc_outputs[caddr] = _s(change)
     elif change > 0:
         used = _used_addresses(rpc)
         cidx = next((i for i, a in enumerate(state["addresses"]["1"]) if a not in used), None)
@@ -415,7 +427,7 @@ def build(rpc, to_address, amount, fee_per_kb=None, subtract_fee=False, send_max
         caddr = state["addresses"]["1"][cidx]
         change_info = {"address": caddr, "index": cidx, "amount": _s(change)}
         outputs.append({"address_n": wk.bip44_path(state["account"], 1, cidx), "amount": _koinu(change), "script_type": "PAYTOADDRESS"})
-        rpc_outputs[caddr] = float(_q(change))
+        rpc_outputs[caddr] = _s(change)
 
     inputs = []
     ref_txs = {}
@@ -428,7 +440,10 @@ def build(rpc, to_address, amount, fee_per_kb=None, subtract_fee=False, send_max
                 ref_txs[u["txid"]] = _ref_tx(rpc, u["txid"])
         inputs.append(inp)
 
+    if len(rpc_outputs) != len(outputs):
+        raise WalletError("Recipient collides with the change address; refusing to build")
     unsigned = rpc("createrawtransaction", [[{"txid": u["txid"], "vout": u["vout"]} for u in chosen], rpc_outputs])
+    _remember_build(source, chosen, to_address, amount, change_info, unsigned)
     return {
         "coin": "Dogecoin",
         "source": source,
@@ -443,6 +458,46 @@ def build(rpc, to_address, amount, fee_per_kb=None, subtract_fee=False, send_max
         "unsigned_hex": unsigned,
         "size_estimate": _estimate_size(len(chosen), len(outputs)),
     }
+
+
+# Server-side memory of what was built, so a signed transaction can be
+# verified here rather than only in the browser (claim 3). Keyed by the
+# exact input set; kept for an hour.
+_builds = {}
+BUILD_TTL = 3600
+
+
+def _inputs_key(ins):
+    return tuple(sorted((i["txid"], int(i["vout"])) for i in ins))
+
+
+def _remember_build(source, chosen, to_address, amount, change_info, unsigned):
+    now = time.time()
+    for k in [k for k, b in _builds.items() if now - b["t"] > BUILD_TTL]:
+        del _builds[k]
+    expected = {to_address: _s(amount)}
+    if change_info:
+        expected[change_info["address"]] = change_info["amount"]
+    _builds[_inputs_key(chosen)] = {"t": now, "source": source, "outputs": expected, "unsigned": unsigned}
+
+
+def verify_against_build(rpc, hexstr):
+    """Return the remembered build this signed tx matches, else raise."""
+    info = decode(rpc, hexstr)
+    key = _inputs_key(info["inputs"])
+    b = _builds.get(key)
+    if not b:
+        raise WalletError("This transaction does not match anything built on this page (inputs differ or the build expired)")
+    got = {}
+    for o in info["outputs"]:
+        if o.get("type") != "pubkeyhash" or not o.get("address"):
+            raise WalletError("Signed transaction contains a non-standard output; refusing")
+        if o["address"] in got:
+            raise WalletError("Signed transaction pays the same address twice; refusing")
+        got[o["address"]] = o["value"]
+    if got != b["outputs"]:
+        raise WalletError("Signed transaction outputs differ from the reviewed transaction; refusing to broadcast")
+    return b, info
 
 
 def decode(rpc, hexstr):
@@ -460,25 +515,33 @@ def decode(rpc, hexstr):
         amap = dict(amap)
         amap[md["address"]] = ("mydoge", 0)
     outs = []
+    if len(d["vout"]) > 200:
+        raise WalletError("Too many outputs")
     for o in d["vout"]:
-        addrs = o.get("scriptPubKey", {}).get("addresses", [])
-        addr = addrs[0] if addrs else None
+        spk = o.get("scriptPubKey", {})
+        addrs = spk.get("addresses", [])
+        # Only a plain single-address P2PKH output can be "mine": a bare
+        # multisig would list our key alongside an attacker's.
+        addr = addrs[0] if (spk.get("type") == "pubkeyhash" and len(addrs) == 1) else None
         mine = bool(addr and addr in amap)
         if addr and not mine:
             try:
-                mine = bool(rpc("validateaddress", [addr]).get("ismine"))
+                v = rpc("validateaddress", [addr])
+                mine = bool(v.get("ismine")) and not v.get("iswatchonly")
             except Exception:  # noqa: BLE001
                 mine = False
-        outs.append({"n": o["n"], "value": _s(o["value"]), "address": addr, "mine": mine})
+        outs.append({"n": o["n"], "value": _s(o["value"]), "address": addr, "type": spk.get("type"), "mine": mine})
     signed = all(v.get("scriptSig", {}).get("hex") for v in d["vin"])
     return {"txid": d["txid"], "size": d.get("size"), "signed": signed,
             "inputs": [{"txid": v["txid"], "vout": v["vout"]} for v in d["vin"]], "outputs": outs}
 
 
-def broadcast(rpc, hexstr):
+def broadcast(rpc, hexstr, unverified=False):
     info = decode(rpc, hexstr)
     if not info["signed"]:
         raise WalletError("This transaction is not signed")
+    if not unverified:
+        verify_against_build(rpc, hexstr)
     try:
         txid = rpc("sendrawtransaction", [hexstr.strip()])
     except Exception as exc:  # noqa: BLE001
@@ -495,7 +558,8 @@ def broadcast(rpc, hexstr):
 
 NODE_FILE = os.path.join(STATE_DIR, "node.json")
 NODE_LABEL = "nodewallet"
-UNLOCK_SECONDS = 20
+UNLOCK_SECONDS = 5
+_sign_lock = threading.Lock()
 
 
 def _node_cfg():
@@ -524,6 +588,10 @@ def node_status(rpc):
         return out
     out["encrypted"] = "unlocked_until" in info
     out["unlocked"] = bool(info.get("unlocked_until", 0))
+    if cfg.get("pending_enable") and out["encrypted"]:
+        cfg = {"enabled": True, "since": cfg.get("since")}
+        _save_node_cfg(cfg)
+        out["enabled"] = True
     bal = _q(info.get("balance", 0))
     unconf = _q(info.get("unconfirmed_balance", 0))
     out["balance"] = {"confirmed": _s(bal), "unconfirmed": _s(unconf)}
@@ -571,15 +639,21 @@ def _node_history(rpc):
             for t in sorted(by_txid.values(), key=lambda t: (t["time"] or 0), reverse=True)]
 
 
-def node_receive(rpc):
-    """Reuse the newest unused labelled address; otherwise mint one."""
+def node_receive(rpc, mint=False):
+    """Return an unused labelled address; mint a new one only when asked
+    (POST), never from a status poll."""
     try:
         for a in rpc("getaddressesbyaccount", [NODE_LABEL]):
             if not rpc("getreceivedbyaddress", [a, 0]):
                 return {"address": a, "path": "node wallet"}
     except Exception:  # noqa: BLE001
         pass
-    return {"address": rpc("getnewaddress", [NODE_LABEL]), "path": "node wallet"}
+    if not mint:
+        return None
+    try:
+        return {"address": rpc("getnewaddress", [NODE_LABEL]), "path": "node wallet"}
+    except Exception as exc:  # noqa: BLE001
+        raise WalletError("Cannot create a new address (" + str(exc) + "). Sign one transaction to refill the keypool, or restart the node.")
 
 
 def _check_passphrase(p):
@@ -613,10 +687,12 @@ def node_encrypt(rpc, passphrase, confirm):
         rpc("encryptwallet", [passphrase], timeout=120)
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
-        # The daemon exits during this call, which can surface as a connection error.
-        if "unlocked_until" in msg or "already encrypted" in msg:
+        if "already encrypted" in msg or "unlocked_until" in msg:
             raise WalletError("Wallet is already encrypted")
-    _save_node_cfg({"enabled": True, "since": int(time.time())})
+        # The daemon exits during this call; a dropped connection is expected.
+    # Mode is switched on by node_status once the restarted node reports an
+    # encrypted wallet, not here.
+    _save_node_cfg({"enabled": False, "pending_enable": True, "since": int(time.time())})
     return {"restarting": True}
 
 
@@ -631,19 +707,29 @@ def node_sign(rpc, unsigned_hex, passphrase):
     unsigned_hex = (unsigned_hex or "").strip()
     if not unsigned_hex or any(c not in "0123456789abcdefABCDEF" for c in unsigned_hex):
         raise WalletError("Not a hex transaction")
+    # Only sign something this page built and the user reviewed.
+    if not any(b["unsigned"] == unsigned_hex and b["source"] == "node" for b in _builds.values()):
+        raise WalletError("The node only signs transactions built and reviewed on this page")
+    if not _sign_lock.acquire(timeout=10):
+        raise WalletError("Another signing operation is in progress")
     try:
-        rpc("walletpassphrase", [passphrase, UNLOCK_SECONDS])
-    except Exception as exc:  # noqa: BLE001
-        raise WalletError("Wrong passphrase" if "incorrect" in str(exc).lower() else "Unlock failed: " + str(exc))
-    try:
-        res = rpc("signrawtransaction", [unsigned_hex], timeout=60)
-    except Exception as exc:  # noqa: BLE001
-        raise WalletError("Signing failed: " + str(exc))
-    finally:
         try:
-            rpc("walletlock")
-        except Exception:  # noqa: BLE001
-            pass
+            rpc("walletpassphrase", [passphrase, UNLOCK_SECONDS])
+        except Exception as exc:  # noqa: BLE001
+            raise WalletError("Wrong passphrase" if "incorrect" in str(exc).lower() else "Unlock failed: " + str(exc))
+        try:
+            res = rpc("signrawtransaction", [unsigned_hex], timeout=UNLOCK_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            raise WalletError("Signing failed: " + str(exc))
+        finally:
+            try:
+                rpc("walletlock")
+                if rpc("getwalletinfo").get("unlocked_until", 0):
+                    rpc("walletlock")
+            except Exception:  # noqa: BLE001
+                pass
+    finally:
+        _sign_lock.release()
     if not res.get("complete"):
         raise WalletError("Node could not fully sign this transaction (inputs not owned by the node wallet?)")
     return {"hex": res["hex"]}
@@ -652,6 +738,11 @@ def node_sign(rpc, unsigned_hex, passphrase):
 def node_backup(rpc):
     """backupwallet writes inside the dogecoind container; the web container
     sees the same directory read-only at /backups for download."""
+    ns = node_status(rpc)
+    if not ns.get("encrypted"):
+        raise WalletError("Refusing to back up an unencrypted wallet: it would contain plaintext keys")
+    if not ns.get("enabled"):
+        raise WalletError("Node wallet mode is not enabled")
     name = "wallet-" + time.strftime("%Y%m%d-%H%M%S") + ".dat"
     try:
         rpc("backupwallet", ["/data/backups/" + name])
@@ -660,9 +751,11 @@ def node_backup(rpc):
     return {"file": name}
 
 
-def backup_path(name):
-    if not name or "/" in name or not name.startswith("wallet-") or not name.endswith(".dat"):
+def backup_path(rpc, name):
+    if not name or "/" in name or "\\" in name or ".." in name or not name.startswith("wallet-") or not name.endswith(".dat"):
         raise WalletError("bad backup name")
+    if "unlocked_until" not in rpc("getwalletinfo"):
+        raise WalletError("Refusing to serve a backup while the wallet is unencrypted")
     path = os.path.join(os.environ.get("BACKUP_DIR", "/backups"), name)
     if not os.path.isfile(path):
         raise WalletError("backup not found")
@@ -700,13 +793,14 @@ def mydoge_connect(rpc, address, pubkey, since_ts=None):
         raise WalletError("MyDoge returned an invalid address (" + str(exc) + ")")
     if kind != "p2pkh":
         raise WalletError("MyDoge address is not P2PKH")
-    if pubkey:
-        try:
-            pk = bytes.fromhex(pubkey)
-        except ValueError:
-            raise WalletError("MyDoge returned a malformed public key")
-        if len(pk) not in (33, 65) or wk.hash160(pk) != h160:
-            raise WalletError("MyDoge public key does not match its address; refusing")
+    if not pubkey:
+        raise WalletError("MyDoge did not provide a public key; cannot prove ownership of the address")
+    try:
+        pk = bytes.fromhex(pubkey)
+    except ValueError:
+        raise WalletError("MyDoge returned a malformed public key")
+    if len(pk) not in (33, 65) or wk.hash160(pk) != h160:
+        raise WalletError("MyDoge public key does not match its address; refusing")
     with _lock:
         if _rescan["running"]:
             raise WalletError("A rescan is already running")
@@ -714,11 +808,6 @@ def mydoge_connect(rpc, address, pubkey, since_ts=None):
         if old and old["address"] == address:
             return {"rescan": False, "already": True}
         cfg = {"address": address, "pubkey": pubkey, "since": int(since_ts or MYDOGE_EPOCH), "created": int(time.time())}
-        os.makedirs(STATE_DIR, exist_ok=True)
-        tmp = MYDOGE_FILE + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(cfg, fh)
-        os.replace(tmp, MYDOGE_FILE)
         _rescan.update(running=True, started=time.time(), error=None)
 
     def job():
@@ -726,9 +815,15 @@ def mydoge_connect(rpc, address, pubkey, since_ts=None):
             reqs = [{"scriptPubKey": {"address": address}, "timestamp": cfg["since"], "watchonly": True, "label": MYDOGE_LABEL}]
             res = rpc("importmulti", [reqs, {"rescan": True}], timeout=None)
             if not res or not res[0].get("success"):
-                _rescan["error"] = "importmulti failed: " + json.dumps((res or [{}])[0].get("error", {}))[:200]
+                _rescan["error"] = "MyDoge import failed: " + json.dumps((res or [{}])[0].get("error", {}))[:200]
+                return
+            os.makedirs(STATE_DIR, exist_ok=True)
+            tmp = MYDOGE_FILE + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(cfg, fh)
+            os.replace(tmp, MYDOGE_FILE)
         except Exception as exc:  # noqa: BLE001
-            _rescan["error"] = str(exc)
+            _rescan["error"] = "MyDoge import failed: " + str(exc)
         finally:
             _rescan["running"] = False
 
@@ -772,14 +867,19 @@ def mydoge_status(rpc):
         rows = rpc("listtransactions", ["*", 200, 0, True])
         by = {}
         for r in rows:
-            if r.get("address") != md["address"]:
+            cat = r.get("category")
+            if cat == "receive" and r.get("address") != md["address"]:
+                continue
+            if cat == "send" and not r.get("involvesWatchonly"):
+                continue
+            if cat not in ("receive", "send"):
                 continue
             t = by.setdefault(r["txid"], {"txid": r["txid"], "time": r.get("time"), "confirmations": r.get("confirmations", 0),
                                           "received": Decimal(0), "sent": Decimal(0), "fee": Decimal(0)})
             amt = _q(r.get("amount", 0))
-            if r.get("category") == "receive":
+            if cat == "receive":
                 t["received"] += amt
-            elif r.get("category") == "send":
+            else:
                 t["sent"] += -amt
         out["transactions"] = [{"txid": t["txid"], "time": t["time"], "confirmations": t["confirmations"],
                                 "net": _s(t["received"] - t["sent"]), "fee": "0.00000000"}

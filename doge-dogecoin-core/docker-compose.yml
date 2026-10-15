@@ -54,8 +54,6 @@ services:
       - -zmqpubhashblock=tcp://0.0.0.0:${APP_DOGECOIN_ZMQ_HASHBLOCK_PORT}
       - -zmqpubrawblock=tcp://0.0.0.0:${APP_DOGECOIN_ZMQ_RAWBLOCK_PORT}
       - -zmqpubrawtx=tcp://0.0.0.0:${APP_DOGECOIN_ZMQ_RAWTX_PORT}
-      # The wallet page imports watch-only addresses only; never store keys here.
-      - -keypool=1
     ports:
       # Dogecoin P2P. Forward this on your router for inbound peers.
       - "22556:22556/tcp"

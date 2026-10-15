@@ -64,6 +64,8 @@ def _decompress(data):
     if len(data) != 33 or data[0] not in (2, 3):
         raise ValueError("bad compressed public key")
     x = int.from_bytes(data[1:], "big")
+    if x >= P:
+        raise ValueError("public key x out of range")
     y_sq = (pow(x, 3, P) + 7) % P
     y = pow(y_sq, (P + 1) // 4, P)
     if (y * y) % P != y_sq:
