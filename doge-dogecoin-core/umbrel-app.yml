@@ -4,7 +4,7 @@ storage:
   dataRoot: data
 category: crypto
 name: Dogecoin Core
-version: "1.19.0"
+version: "1.19.1"
 tagline: Dogecoin full node with a watch-only Trezor wallet
 icon: https://raw.githubusercontent.com/dogecoin/dogecoin/master/share/pixmaps/dogecoin256.png
 description: >-
@@ -61,7 +61,7 @@ releaseNotes: >-
   network (10.21.21.231); apps that connected by container name keep
   working.
 
-developer: fossmining (node: Dogecoin Core developers)
+developer: fossmining
 website: https://dogecoin.com
 dependencies: []
 repo: https://github.com/dogecoin/dogecoin
