@@ -1,0 +1,453 @@
+"""Watch-only Dogecoin wallet backend for the Umbrel dashboard (stdlib only).
+
+Security model
+--------------
+* The node's wallet.dat only ever receives *watch-only* addresses derived
+  from a Trezor account xpub (importmulti with watchonly=true). No private
+  key is ever generated, imported, derived or stored by this code.
+* Spending: this module builds an unsigned transaction from the node's own
+  UTXO set and returns everything a Trezor needs to sign it (inputs with
+  BIP44 paths, outputs, and the referenced previous transactions pulled from
+  the local node). The signed hex comes back and is broadcast by the local
+  node. Trezor's servers never learn which addresses belong to this wallet.
+* Every mutating endpoint requires a same-origin request with a custom
+  header, so a malicious web page in the same browser cannot drive it.
+"""
+
+import json
+import os
+import threading
+import time
+from decimal import Decimal, ROUND_DOWN
+
+import walletkeys as wk
+
+STATE_DIR = os.environ.get("STATE_DIR", "/state")
+STATE_FILE = os.path.join(STATE_DIR, "account.json")
+LABEL = "trezor-watchonly"
+GAP_LIMIT = 20
+KOINU = Decimal("100000000")
+DUST = Decimal("0.01")                 # Dogecoin Core 1.14.x dust threshold
+DEFAULT_FEE_PER_KB = Decimal("0.01")   # recommended fee rate, DOGE/kB
+MIN_FEE_PER_KB = Decimal("0.001")      # minimum relay fee, DOGE/kB
+MAX_FEE_PER_KB = Decimal("10")
+
+_lock = threading.Lock()
+_rescan = {"running": False, "started": 0, "error": None}
+
+
+class WalletError(Exception):
+    pass
+
+
+def _q(d):
+    """Exact 8-decimal Decimal. Floats from JSON-RPC go through str() so
+    89.99 stays 89.99 instead of its binary expansion."""
+    if isinstance(d, float):
+        d = repr(d)
+    return Decimal(d).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+
+
+def _s(d):
+    """Fixed 8-decimal string, never scientific notation."""
+    return "{:.8f}".format(_q(d))
+
+
+def _koinu(d):
+    return str(int((_q(d) * KOINU).to_integral_value(ROUND_DOWN)))
+
+
+# --- state ---------------------------------------------------------------
+
+def load_state():
+    try:
+        with open(STATE_FILE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=1)
+    os.replace(tmp, STATE_FILE)
+
+
+def _addr_map(state):
+    """address -> (change, index)."""
+    out = {}
+    for change in (0, 1):
+        for i, a in enumerate(state["addresses"][str(change)]):
+            out[a] = (change, i)
+    return out
+
+
+# --- import / derivation -------------------------------------------------
+
+def _derive_batch(xpub, change, start, count):
+    chain = xpub.derive(change)
+    out = []
+    for i in range(start, start + count):
+        out.append(chain.derive(i).address())
+    return out
+
+
+def _import_addresses(rpc, addrs, timestamp, rescan):
+    if not addrs:
+        return
+    reqs = [
+        {"scriptPubKey": {"address": a}, "timestamp": timestamp, "watchonly": True, "label": LABEL}
+        for a in addrs
+    ]
+    res = rpc("importmulti", [reqs, {"rescan": rescan}], timeout=None if rescan else 60)
+    bad = [r for r in res if not r.get("success")]
+    if bad:
+        raise WalletError("importmulti failed: " + json.dumps(bad[0].get("error", {}))[:200])
+
+
+def start_import(rpc, xpub_str, account_index, since_ts):
+    """Import the first GAP_LIMIT receive+change addresses. Rescan runs in
+    the background when a start date is given, because a rescan of the
+    Dogecoin chain can take hours."""
+    with _lock:
+        if _rescan["running"]:
+            raise WalletError("A rescan is already running")
+        if load_state():
+            raise WalletError("An account is already imported. Forget it first.")
+        try:
+            xpub = wk.Xpub(xpub_str.strip())
+        except ValueError as exc:
+            raise WalletError("Invalid xpub: " + str(exc))
+        if xpub.depth != 3:
+            raise WalletError(
+                "This key is at depth " + str(xpub.depth) + ", not an account key. "
+                "Export the account-level public key (m/44'/3'/" + str(account_index) + "') from Trezor Suite."
+            )
+        state = {
+            "xpub": xpub.serialize(),
+            "fingerprint": xpub.own_fingerprint().hex(),
+            "account": int(account_index),
+            "since": since_ts,
+            "created": int(time.time()),
+            "addresses": {"0": _derive_batch(xpub, 0, 0, GAP_LIMIT), "1": _derive_batch(xpub, 1, 0, GAP_LIMIT)},
+        }
+        rescan = bool(since_ts)
+        timestamp = int(since_ts) if since_ts else "now"
+        all_addrs = state["addresses"]["0"] + state["addresses"]["1"]
+        save_state(state)
+        if not rescan:
+            _import_addresses(rpc, all_addrs, timestamp, False)
+            return {"rescan": False}
+        _rescan.update(running=True, started=time.time(), error=None)
+
+    def job():
+        try:
+            _import_addresses(rpc, all_addrs, timestamp, True)
+            extend_gap(rpc)
+        except Exception as exc:  # noqa: BLE001
+            _rescan["error"] = str(exc)
+        finally:
+            _rescan["running"] = False
+
+    threading.Thread(target=job, daemon=True).start()
+    return {"rescan": True}
+
+
+def forget(rpc):
+    """Forget the account. The watch-only addresses stay in wallet.dat
+    (Dogecoin Core 1.14 cannot remove them) but the UI stops using them."""
+    with _lock:
+        if _rescan["running"]:
+            raise WalletError("Wait for the rescan to finish")
+        try:
+            os.remove(STATE_FILE)
+        except OSError:
+            pass
+
+
+def _used_addresses(rpc):
+    rows = rpc("listreceivedbyaddress", [0, True, True])
+    return {r["address"] for r in rows if r.get("txids")}
+
+
+def extend_gap(rpc):
+    """Make sure GAP_LIMIT unused addresses exist after the last used one on
+    each chain, importing new ones (no rescan: they cannot have history
+    before now that the earlier ones didn't reveal)."""
+    with _lock:
+        state = load_state()
+        if not state or _rescan["running"]:
+            return
+        used = _used_addresses(rpc)
+        xpub = wk.Xpub(state["xpub"])
+        changed = False
+        for change in (0, 1):
+            lst = state["addresses"][str(change)]
+            last_used = max((i for i, a in enumerate(lst) if a in used), default=-1)
+            need = last_used + 1 + GAP_LIMIT - len(lst)
+            if need > 0:
+                new = _derive_batch(xpub, change, len(lst), need)
+                _import_addresses(rpc, new, "now", False)
+                lst.extend(new)
+                changed = True
+        if changed:
+            save_state(state)
+
+
+# --- read side -----------------------------------------------------------
+
+def _our_utxos(rpc, state):
+    amap = _addr_map(state)
+    utxos = []
+    for u in rpc("listunspent", [0, 9999999, list(amap.keys())]):
+        if u.get("address") not in amap:
+            continue
+        if u.get("spendable"):
+            # Should be impossible: it would mean a private key is on the node.
+            continue
+        change, idx = amap[u["address"]]
+        utxos.append({
+            "txid": u["txid"], "vout": u["vout"], "address": u["address"],
+            "amount": _s(u["amount"]), "confirmations": u.get("confirmations", 0),
+            "change": change, "index": idx,
+        })
+    return utxos
+
+
+def status(rpc):
+    state = load_state()
+    out = {
+        "imported": bool(state),
+        "rescan": {"running": _rescan["running"], "started": _rescan["started"], "error": _rescan["error"]},
+        "gap_limit": GAP_LIMIT,
+        "fee": {"default_per_kb": str(DEFAULT_FEE_PER_KB), "min_per_kb": str(MIN_FEE_PER_KB), "dust": str(DUST)},
+    }
+    try:
+        info = rpc("getwalletinfo")
+        hot = Decimal(str(info.get("balance", 0))) + Decimal(str(info.get("unconfirmed_balance", 0)))
+        out["hot_balance"] = _s(hot)  # spendable funds in the node wallet: should always be 0
+    except Exception:  # noqa: BLE001
+        out["hot_balance"] = None
+    if not state:
+        return out
+    xp = wk.Xpub(state["xpub"])
+    out["account"] = {"fingerprint": state["fingerprint"], "index": state["account"], "since": state["since"],
+                      "xpub": state["xpub"], "xpub_forms": [xp.serialize(v) for v in wk.XPUB_VERSIONS],
+                      "receive_count": len(state["addresses"]["0"]), "change_count": len(state["addresses"]["1"])}
+    if _rescan["running"]:
+        return out
+    try:
+        extend_gap(rpc)
+        state = load_state()
+        utxos = _our_utxos(rpc, state)
+        conf = sum(Decimal(u["amount"]) for u in utxos if u["confirmations"] > 0)
+        unconf = sum(Decimal(u["amount"]) for u in utxos if u["confirmations"] == 0)
+        out["balance"] = {"confirmed": _s(conf), "unconfirmed": _s(unconf)}
+        out["utxos"] = utxos
+        out["receive"] = next_receive(rpc, state)
+        out["transactions"] = _history(rpc, state)
+    except WalletError as exc:
+        out["error"] = str(exc)
+    return out
+
+
+def next_receive(rpc, state=None):
+    state = state or load_state()
+    if not state:
+        raise WalletError("No account imported")
+    used = _used_addresses(rpc)
+    for i, a in enumerate(state["addresses"]["0"]):
+        if a not in used:
+            return {"address": a, "index": i, "path": "m/44'/3'/" + str(state["account"]) + "'/0/" + str(i),
+                    "address_n": wk.bip44_path(state["account"], 0, i)}
+    raise WalletError("No unused receive address (gap limit); refresh and try again")
+
+
+def _history(rpc, state):
+    amap = _addr_map(state)
+    rows = rpc("listtransactions", ["*", 200, 0, True])
+    by_txid = {}
+    for r in rows:
+        if r.get("address") not in amap or not r.get("involvesWatchonly", True):
+            continue
+        t = by_txid.setdefault(r["txid"], {"txid": r["txid"], "time": r.get("time"), "confirmations": r.get("confirmations", 0),
+                                           "received": Decimal(0), "sent": Decimal(0), "fee": Decimal(0)})
+        amt = Decimal(str(r.get("amount", 0)))
+        if r.get("category") == "receive":
+            t["received"] += amt
+        elif r.get("category") == "send":
+            t["sent"] += -amt
+            if r.get("fee") is not None:
+                t["fee"] = -Decimal(str(r["fee"]))
+    out = []
+    for t in sorted(by_txid.values(), key=lambda t: (t["time"] or 0), reverse=True):
+        net = t["received"] - t["sent"]
+        out.append({"txid": t["txid"], "time": t["time"], "confirmations": t["confirmations"],
+                    "net": _s(net), "fee": _s(t["fee"])})
+    return out
+
+
+# --- send side -----------------------------------------------------------
+
+def _estimate_size(n_in, n_out):
+    return 10 + 148 * n_in + 34 * n_out
+
+
+def _ref_tx(rpc, txid):
+    """Previous transaction in the shape Trezor Connect expects, fetched
+    from the local node (the UTXO belongs to the wallet so gettransaction
+    works without -txindex)."""
+    try:
+        hexstr = rpc("gettransaction", [txid, True])["hex"]
+    except Exception as exc:  # noqa: BLE001
+        raise WalletError("Cannot load previous transaction " + txid + ": " + str(exc))
+    d = rpc("decoderawtransaction", [hexstr])
+    return {
+        "hash": d["txid"],
+        "version": d["version"],
+        "lock_time": d["locktime"],
+        "inputs": [
+            {"prev_hash": v["txid"], "prev_index": v["vout"], "script_sig": v["scriptSig"]["hex"], "sequence": v["sequence"]}
+            for v in d["vin"]
+        ],
+        "bin_outputs": [
+            {"amount": _koinu(o["value"]), "script_pubkey": o["scriptPubKey"]["hex"]} for o in d["vout"]
+        ],
+    }
+
+
+def build(rpc, to_address, amount, fee_per_kb=None, subtract_fee=False, send_max=False):
+    state = load_state()
+    if not state:
+        raise WalletError("No account imported")
+    if _rescan["running"]:
+        raise WalletError("Rescan still running")
+    to_address = (to_address or "").strip()
+    try:
+        wk.validate_doge_address(to_address)
+    except ValueError as exc:
+        raise WalletError("Recipient is not a valid Dogecoin address (" + str(exc) + ")")
+    try:
+        fee_per_kb = _q(Decimal(str(fee_per_kb))) if fee_per_kb not in (None, "") else DEFAULT_FEE_PER_KB
+    except Exception:  # noqa: BLE001
+        raise WalletError("Invalid fee rate")
+    if not (MIN_FEE_PER_KB <= fee_per_kb <= MAX_FEE_PER_KB):
+        raise WalletError("Fee rate must be between " + str(MIN_FEE_PER_KB) + " and " + str(MAX_FEE_PER_KB) + " DOGE/kB")
+
+    utxos = [u for u in _our_utxos(rpc, state) if u["confirmations"] > 0]
+    if not utxos:
+        raise WalletError("No confirmed coins to spend")
+    utxos.sort(key=lambda u: Decimal(u["amount"]), reverse=True)
+    total_avail = sum(Decimal(u["amount"]) for u in utxos)
+
+    if send_max:
+        chosen = utxos
+        fee = _q(fee_per_kb * _estimate_size(len(chosen), 1) / 1000)
+        amount = total_avail - fee
+        if amount <= DUST:
+            raise WalletError("Balance too small to send after fee")
+        change = Decimal(0)
+    else:
+        try:
+            amount = _q(Decimal(str(amount)))
+        except Exception:  # noqa: BLE001
+            raise WalletError("Invalid amount")
+        if amount < DUST:
+            raise WalletError("Amount is below the dust limit of " + str(DUST) + " DOGE")
+        chosen, acc = [], Decimal(0)
+        fee = Decimal(0)
+        for u in utxos:
+            chosen.append(u)
+            acc += Decimal(u["amount"])
+            fee = _q(fee_per_kb * _estimate_size(len(chosen), 2) / 1000)
+            target = amount if subtract_fee else amount + fee
+            if acc >= target:
+                break
+        target = amount if subtract_fee else amount + fee
+        if acc < target:
+            raise WalletError("Insufficient confirmed balance: have " + _s(total_avail) + ", need " + _s(target) + " incl. fee")
+        if subtract_fee:
+            amount = amount - fee
+            if amount <= DUST:
+                raise WalletError("Amount after subtracting the fee is below dust")
+            change = acc - amount - fee
+        else:
+            change = acc - amount - fee
+        if change < DUST:
+            # Change would be dust: add it to the fee instead.
+            fee += change
+            change = Decimal(0)
+    if fee > Decimal("100") and fee > amount:
+        raise WalletError("Refusing an absurdly high fee (" + str(fee) + " DOGE)")
+
+    outputs = [{"address": to_address, "amount": _koinu(amount), "script_type": "PAYTOADDRESS"}]
+    rpc_outputs = {to_address: float(_q(amount))}
+    change_info = None
+    if change > 0:
+        used = _used_addresses(rpc)
+        cidx = next((i for i, a in enumerate(state["addresses"]["1"]) if a not in used), None)
+        if cidx is None:
+            raise WalletError("No unused change address; refresh and try again")
+        caddr = state["addresses"]["1"][cidx]
+        change_info = {"address": caddr, "index": cidx, "amount": _s(change)}
+        outputs.append({"address_n": wk.bip44_path(state["account"], 1, cidx), "amount": _koinu(change), "script_type": "PAYTOADDRESS"})
+        rpc_outputs[caddr] = float(_q(change))
+
+    inputs = []
+    ref_txs = {}
+    for u in chosen:
+        inputs.append({
+            "address_n": wk.bip44_path(state["account"], u["change"], u["index"]),
+            "prev_hash": u["txid"], "prev_index": u["vout"], "amount": _koinu(u["amount"]),
+            "script_type": "SPENDADDRESS", "address": u["address"],
+        })
+        if u["txid"] not in ref_txs:
+            ref_txs[u["txid"]] = _ref_tx(rpc, u["txid"])
+
+    unsigned = rpc("createrawtransaction", [[{"txid": u["txid"], "vout": u["vout"]} for u in chosen], rpc_outputs])
+    return {
+        "coin": "Dogecoin",
+        "inputs": inputs,
+        "outputs": outputs,
+        "refTxs": list(ref_txs.values()),
+        "to": to_address,
+        "amount": _s(amount),
+        "fee": _s(fee),
+        "fee_per_kb": str(fee_per_kb),
+        "change": change_info,
+        "unsigned_hex": unsigned,
+        "size_estimate": _estimate_size(len(chosen), len(outputs)),
+    }
+
+
+def decode(rpc, hexstr):
+    hexstr = (hexstr or "").strip()
+    if not hexstr or any(c not in "0123456789abcdefABCDEF" for c in hexstr):
+        raise WalletError("Not a hex transaction")
+    try:
+        d = rpc("decoderawtransaction", [hexstr])
+    except Exception as exc:  # noqa: BLE001
+        raise WalletError("Cannot decode: " + str(exc))
+    state = load_state()
+    amap = _addr_map(state) if state else {}
+    outs = []
+    for o in d["vout"]:
+        addrs = o.get("scriptPubKey", {}).get("addresses", [])
+        outs.append({"n": o["n"], "value": _s(o["value"]), "address": addrs[0] if addrs else None,
+                     "mine": bool(addrs and addrs[0] in amap)})
+    signed = all(v.get("scriptSig", {}).get("hex") for v in d["vin"])
+    return {"txid": d["txid"], "size": d.get("size"), "signed": signed,
+            "inputs": [{"txid": v["txid"], "vout": v["vout"]} for v in d["vin"]], "outputs": outs}
+
+
+def broadcast(rpc, hexstr):
+    info = decode(rpc, hexstr)
+    if not info["signed"]:
+        raise WalletError("This transaction is not signed")
+    try:
+        txid = rpc("sendrawtransaction", [hexstr.strip()])
+    except Exception as exc:  # noqa: BLE001
+        raise WalletError("Node rejected the transaction: " + str(exc))
+    return {"txid": txid}

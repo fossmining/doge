@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dogecoin Wallet · Trezor watch-only</title>
+<style>
+:root{--bg:#0f0e0c;--card:#1b1915;--line:#2c2922;--fg:#f3efe6;--mut:#a39d8f;--acc:#c2a633;--ok:#5cb85c;--bad:#e06c5c;--warn:#e0a35c}
+@media (prefers-color-scheme: light){:root{--bg:#f7f4ec;--card:#fff;--line:#e6e0d2;--fg:#1c1a15;--mut:#6b6558;--acc:#a8901f}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:960px;margin:0 auto;padding:24px 16px 48px}
+header{display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+header h1{font-size:22px;margin:0}header a{color:var(--mut);text-decoration:none;font-size:13px}
+.badge{font-size:12px;padding:3px 10px;border-radius:99px;border:1px solid var(--line);color:var(--mut)}
+.badge.ok{color:var(--ok);border-color:var(--ok)}.badge.warn{color:var(--warn);border-color:var(--warn)}.badge.bad{color:var(--bad);border-color:var(--bad)}
+nav{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:16px;overflow-x:auto}
+nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--mut);padding:10px 14px;font-size:14px;cursor:pointer;white-space:nowrap}
+nav button.on{color:var(--fg);border-bottom-color:var(--acc)}
+section{display:none}section.on{display:block}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:12px}
+.k{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.06em}.v{font-size:26px;font-weight:600;margin-top:4px;font-variant-numeric:tabular-nums;word-break:break-all}
+.v small{font-size:13px;color:var(--mut);font-weight:400}
+h2{font-size:15px;margin:20px 0 10px}h3{font-size:14px;margin:0 0 8px}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{color:var(--mut);font-weight:500}td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+code,.mono{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
+label{display:block;font-size:13px;color:var(--mut);margin:12px 0 4px}
+input[type=text],input[type=number],input[type=date],textarea,select{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:9px 10px;font:14px ui-monospace,SFMono-Regular,Menlo,monospace}
+textarea{min-height:90px;resize:vertical}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.row>*{flex:1 1 180px}.row>.fix{flex:0 0 auto}
+button.btn{background:var(--acc);color:#1c1a15;border:0;border-radius:8px;padding:10px 16px;font-size:14px;font-weight:600;cursor:pointer}
+button.btn.sec{background:none;border:1px solid var(--line);color:var(--fg);font-weight:500}
+button.btn.danger{background:none;border:1px solid var(--bad);color:var(--bad)}
+button.btn:disabled{opacity:.5;cursor:default}
+button.mini{background:none;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:2px 8px;font-size:12px;cursor:pointer;margin-left:6px}
+.msg{color:var(--mut);font-size:13px;margin-top:8px}.msg.bad{color:var(--bad)}.msg.ok{color:var(--ok)}.msg.warn{color:var(--warn)}
+.alert{border:1px solid var(--warn);background:rgba(224,163,92,.08);border-radius:10px;padding:12px 14px;font-size:13px;margin-bottom:12px}
+.alert.bad{border-color:var(--bad);background:rgba(224,108,92,.08)}
+.addr{font:18px ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all;padding:12px;border:1px dashed var(--line);border-radius:10px;margin:8px 0}
+.qr{display:block;margin:8px auto;background:#fff;padding:8px;border-radius:8px}
+.check{display:flex;gap:8px;align-items:flex-start;font-size:13px;margin:8px 0}.check input{margin-top:3px}
+ol{padding-left:20px;font-size:13px;color:var(--mut)}ol li{margin:4px 0}
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.step{border:1px solid var(--line);border-radius:10px;padding:12px;font-size:13px}.step b{display:block;margin-bottom:4px}
+.hide{display:none}
+</style></head><body><main>
+<header>
+<svg width="36" height="36" viewBox="0 0 36 36" aria-hidden="true"><circle cx="18" cy="18" r="17" fill="#c2a633"/><text x="18" y="25" text-anchor="middle" font-size="20" font-weight="700" fill="#fff" font-family="system-ui">&#272;</text></svg>
+<h1>Dogecoin Wallet</h1><span id="mode" class="badge">watch-only · Trezor</span>
+<span id="nodestate" class="badge">node: …</span>
+<a href="./" style="margin-left:auto">&larr; Node dashboard</a>
+</header>
+
+<div id="hotwarn" class="alert bad hide"><b>Warning:</b> the node's own wallet.dat holds <span id="hotbal"></span> DOGE in <i>spendable</i> keys. This wallet page is designed so the node never holds private keys. Move those coins to your Trezor and do not use the node wallet for funds.</div>
+<div id="rescanwarn" class="alert hide">Rescanning the blockchain for this account's history (started <span id="rescanstart"></span>). This can take a long time on a full Dogecoin chain. Balances appear when it finishes; you can leave this page.</div>
+<div id="errbar" class="alert bad hide"></div>
+
+<nav>
+<button data-tab="overview" class="on">Overview</button>
+<button data-tab="receive">Receive</button>
+<button data-tab="send">Send</button>
+<button data-tab="broadcast">Broadcast</button>
+<button data-tab="setup">Setup</button>
+</nav>
+
+<section id="tab-overview" class="on">
+<div id="noacct" class="card hide">
+<h3>No Trezor account linked yet</h3>
+<p class="msg">This page turns your Dogecoin node into a watch-only wallet for a Trezor account. Your private keys stay on the Trezor; the node only learns your <i>public</i> addresses and watches them. Open <b>Setup</b> to link an account.</p>
+</div>
+<div id="acct" class="hide">
+<div class="grid">
+<div class="card"><div class="k">Confirmed balance</div><div class="v" id="bal">-</div></div>
+<div class="card"><div class="k">Unconfirmed</div><div class="v" id="unbal">-</div></div>
+<div class="card"><div class="k">Account</div><div class="v" id="acctinfo" style="font-size:16px">-</div></div>
+<div class="card"><div class="k">Watched addresses</div><div class="v" id="addrcount">-</div></div>
+</div>
+<h2>Transactions</h2>
+<div class="card"><table id="txtable"><tr><td class="msg">No transactions yet</td></tr></table></div>
+<h2>Coins (UTXOs)</h2>
+<div class="card"><table id="utxotable"><tr><td class="msg">None</td></tr></table></div>
+</div>
+</section>
+
+<section id="tab-receive">
+<div class="card">
+<h3>Next unused receive address</h3>
+<div class="addr" id="rcvaddr">-</div>
+<p class="msg">Path <code id="rcvpath">-</code> <button class="mini" id="copyaddr">copy</button></p>
+<div class="alert">Before sending large amounts here, verify the address <b>on the Trezor screen</b>: click below and compare every character. An address shown only on a computer screen can be swapped by malware.</div>
+<button class="btn" id="verifyaddr">Show &amp; verify on Trezor</button>
+<p class="msg" id="rcvmsg"></p>
+</div>
+</section>
+
+<section id="tab-send">
+<div class="card" id="sendform">
+<h3>Build a transaction</h3>
+<p class="msg">The transaction is assembled from your own node's coins and signed <b>only</b> on the Trezor. Nothing here can spend without the device.</p>
+<label for="to">Recipient address</label><input type="text" id="to" placeholder="D…" autocomplete="off" spellcheck="false">
+<div class="row">
+<div><label for="amount">Amount (DOGE)</label><input type="text" id="amount" placeholder="0.00" inputmode="decimal" autocomplete="off"></div>
+<div><label for="feerate">Fee rate (DOGE/kB)</label><input type="text" id="feerate" inputmode="decimal" autocomplete="off"></div>
+</div>
+<div class="check"><input type="checkbox" id="sendmax"><label for="sendmax" style="margin:0">Send entire balance (sweep)</label></div>
+<div class="check"><input type="checkbox" id="subfee"><label for="subfee" style="margin:0">Subtract fee from amount</label></div>
+<div class="row" style="margin-top:12px"><button class="btn fix" id="build">Review transaction</button><span class="msg" id="buildmsg"></span></div>
+</div>
+
+<div class="card hide" id="review">
+<h3>Review</h3>
+<table>
+<tr><th>To</th><td><code id="rv-to"></code></td></tr>
+<tr><th>Amount</th><td class="mono" id="rv-amt"></td></tr>
+<tr><th>Fee</th><td class="mono" id="rv-fee"></td></tr>
+<tr><th>Change</th><td class="mono" id="rv-change"></td></tr>
+<tr><th>Inputs</th><td class="mono" id="rv-in"></td></tr>
+</table>
+<div class="alert" style="margin-top:12px">The Trezor will show the recipient and amount on its own screen. <b>Only confirm on the device if they match what you typed.</b> The computer screen is not the source of truth; the Trezor is.</div>
+<h3 style="margin-top:14px">Sign</h3>
+<div class="steps">
+<div class="step"><b>A · Sign with Trezor in this browser</b>Uses Trezor Connect (loaded from connect.trezor.io only when you click). Works with Trezor Suite open (its Bridge) or WebUSB in Chrome/Chromium. The previous transactions are supplied from your node, so Trezor's servers are not asked about your addresses.
+<div style="margin-top:8px"><button class="btn" id="signtrezor">Connect Trezor &amp; sign</button></div></div>
+<div class="step"><b>B · Air-gapped / other signer</b>Download the unsigned transaction and its input details, sign it on an offline machine (e.g. Dogecoin Core with <code>signrawtransaction</code>), then paste the signed hex in <b>Broadcast</b>.
+<div style="margin-top:8px"><button class="btn sec" id="dlunsigned">Download unsigned JSON</button> <button class="mini" id="copyunsigned">copy hex</button></div></div>
+</div>
+<p class="msg" id="signmsg"></p>
+<div id="signed" class="hide">
+<h3 style="margin-top:14px">Signed transaction</h3>
+<textarea id="signedhex" readonly></textarea>
+<div class="row" style="margin-top:8px"><button class="btn fix" id="bcast">Broadcast via my node</button><button class="btn sec fix" id="cancelsigned">Discard</button><span class="msg" id="bcastmsg"></span></div>
+</div>
+</div>
+</section>
+
+<section id="tab-broadcast">
+<div class="card">
+<h3>Broadcast a signed transaction</h3>
+<p class="msg">Paste a fully signed raw transaction (hex). It is decoded and shown before anything is sent to the network.</p>
+<textarea id="rawhex" placeholder="0100000001…" spellcheck="false"></textarea>
+<div class="row" style="margin-top:8px"><button class="btn sec fix" id="decode">Decode</button><button class="btn fix" id="bcast2" disabled>Broadcast</button><span class="msg" id="decmsg"></span></div>
+<table id="dectable" class="hide" style="margin-top:12px"></table>
+</div>
+</section>
+
+<section id="tab-setup">
+<div class="card" id="setupform">
+<h3>Link a Trezor Dogecoin account (public key only)</h3>
+<ol>
+<li>Open <b>Trezor Suite</b> → your Dogecoin account → the <b>⋯</b> menu → <b>Show public key (XPUB)</b>.</li>
+<li>Paste the key below. It starts with <code>dgub</code> or <code>xpub</code>. <b>Never</b> paste anything starting with <code>dgpv</code>/<code>xprv</code> — that is a private key and this page refuses it.</li>
+<li>Optionally enter the date the account was created so the node rescans its history. Without a date only future transactions are tracked.</li>
+</ol>
+<label for="xpub">Account public key (dgub / xpub)</label><textarea id="xpub" placeholder="dgub8…" spellcheck="false"></textarea>
+<div class="row">
+<div><label for="acctidx">Account number in Trezor Suite (first = 0)</label><input type="number" id="acctidx" value="0" min="0" max="99"></div>
+<div><label for="since">History from date (optional, triggers rescan)</label><input type="date" id="since"></div>
+</div>
+<div class="row" style="margin-top:12px"><button class="btn fix" id="doimport">Link account</button><span class="msg" id="setupmsg"></span></div>
+</div>
+<div class="card hide" id="setupdone">
+<h3>Linked account</h3>
+<table>
+<tr><th>Fingerprint</th><td><code id="st-fp"></code></td></tr>
+<tr><th>Account</th><td class="mono" id="st-acct"></td></tr>
+<tr><th>Public key</th><td><code id="st-xpub"></code></td></tr>
+<tr><th>Addresses watched</th><td class="mono" id="st-count"></td></tr>
+</table>
+<p class="msg">Forgetting the account stops this page from using it. Dogecoin Core 1.14 cannot un-import watch-only addresses, so they remain in the node wallet file (harmless: public data).</p>
+<button class="btn danger" id="forget">Forget account</button>
+</div>
+<div class="card">
+<h3>How this stays safe</h3>
+<ol>
+<li>The node only holds <b>watch-only</b> addresses. There is no code path that can derive, import or store a private key.</li>
+<li>Spends are built from your node's own coin data and signed only on the Trezor, which displays amount and recipient on its screen.</li>
+<li>Trezor Connect is loaded from <code>connect.trezor.io</code> only when you click <i>Connect Trezor</i>; the page's Content-Security-Policy blocks every other origin.</li>
+<li>Broadcast goes through your node, not a third-party API. Receive addresses can be verified on the device.</li>
+<li>Reach this page only through your Umbrel (its login protects it). Never through a link someone sent you.</li>
+</ol>
+</div>
+</section>
+</main>
+<script src="wallet.js"></script>
+</body></html>

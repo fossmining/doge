@@ -3,10 +3,14 @@
 import base64
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import wallet  # noqa: E402  (watch-only Trezor wallet backend)
 
 PORT = int(os.environ.get("PORT", "3000"))
 RPC_URL = "http://" + os.environ["RPC_HOST"] + ":" + os.environ["RPC_PORT"] + "/"
@@ -36,11 +40,11 @@ class RpcError(Exception):
     pass
 
 
-def rpc(method, params=None):
+def rpc(method, params=None, timeout=10):
     body = json.dumps({"jsonrpc": "1.0", "id": "dash", "method": method, "params": params or []}).encode()
     req = urllib.request.Request(RPC_URL, data=body, headers={"Authorization": AUTH, "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         try:
@@ -155,7 +159,7 @@ button{background:none;border:1px solid var(--line);color:var(--fg);border-radiu
 .msg{color:var(--mut);margin-top:8px;font-size:13px}
 </style></head><body><main>
 <header><svg width="36" height="36" viewBox="0 0 36 36" aria-hidden="true"><circle cx="18" cy="18" r="17" fill="#c2a633"/><text x="18" y="25" text-anchor="middle" font-size="20" font-weight="700" fill="#fff" font-family="system-ui">&#272;</text></svg>
-<h1>Dogecoin Core</h1><span id="state" class="badge">starting</span></header>
+<h1>Dogecoin Core</h1><span id="state" class="badge">starting</span><a href="wallet" class="badge" style="margin-left:auto;text-decoration:none;color:var(--acc);border-color:var(--acc)">Wallet (Trezor) &rarr;</a></header>
 <div class="card"><div class="k">Blockchain sync</div><div class="v" id="pct">-</div><div class="bar"><i id="barfill"></i></div><div class="msg" id="msg"></div></div>
 <div class="grid" style="margin-top:12px">
 <div class="card"><div class="k">Block height</div><div class="v" id="blocks">-</div></div>
@@ -169,41 +173,28 @@ button{background:none;border:1px solid var(--line);color:var(--fg);border-radiu
 <div class="card"><table id="peertable"><tr><td class="msg">No peers yet</td></tr></table></div>
 <p class="msg">Version <span id="ver"></span><span id="upwrap" hidden> &middot; uptime <span id="uptime">-</span></span></p>
 </main>
-<script>
-var showPass=false,last=null;
-function n(x){return (x===null||x===undefined)?'-':Number(x).toLocaleString()}
-function esc(s){return String(s===undefined||s===null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
-function dur(s){if(!s)return '-';var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+'d ':'')+h+'h '+m+'m'}
-function row(k,v,copy){return '<tr><th>'+esc(k)+'</th><td><code>'+esc(v)+'</code>'+(copy?'<button data-c="'+esc(v)+'">copy</button>':'')+'</td></tr>'}
-function renderConn(c){
- var pass=showPass?c.rpc_pass:'••••••••••••';
- var h=row('RPC host (from Umbrel apps)',c.node_host,true)+row('RPC port',c.rpc_port,true)+row('RPC user',c.rpc_user,true)+
- '<tr><th>RPC password</th><td><code>'+esc(pass)+'</code><button id="tog">'+(showPass?'hide':'show')+'</button><button data-c="'+esc(c.rpc_pass)+'">copy</button></td></tr>'+
- row('ZMQ hashblock','tcp://'+c.node_host+':'+c.zmq.hashblock,true)+row('ZMQ rawblock','tcp://'+c.node_host+':'+c.zmq.rawblock,true)+
- row('ZMQ rawtx','tcp://'+c.node_host+':'+c.zmq.rawtx,true)+row('P2P (inbound peers)',c.device+':'+c.p2p_port,true);
- document.getElementById('conn').innerHTML=h;
- document.getElementById('tog').onclick=function(){showPass=!showPass;renderConn(c)};
-}
-document.addEventListener('click',function(e){var v=e.target.getAttribute&&e.target.getAttribute('data-c');if(v!==null&&v!==undefined&&navigator.clipboard){navigator.clipboard.writeText(v);e.target.textContent='copied';setTimeout(function(){e.target.textContent='copy'},1200)}});
-function render(s){
- var st=document.getElementById('state');st.textContent=s.state;st.className='badge '+s.state;
- var p=s.progress||0;document.getElementById('pct').textContent=(s.state==='starting')?'Starting…':(Math.floor(p*1000)/10)+'%';
- document.getElementById('barfill').style.width=(p*100)+'%';
- document.getElementById('msg').textContent=s.message?s.message:(s.headers?('Block '+n(s.blocks)+' of '+n(s.headers)+' headers'):'');
- document.getElementById('blocks').textContent=n(s.blocks);
- document.getElementById('peers').textContent=s.connections===undefined?'-':s.connections+' ('+s.inbound+' in / '+s.outbound+' out)';
- document.getElementById('mempool').textContent=s.mempool_txs===undefined?'-':n(s.mempool_txs)+' txs';
- document.getElementById('size').textContent=s.size_on_disk?(s.size_on_disk/1e9).toFixed(1)+' GB':'-';
- document.getElementById('ver').textContent=(s.subversion||('v'+s.connection.version));
- if(s.uptime){document.getElementById('upwrap').hidden=false;document.getElementById('uptime').textContent=dur(s.uptime)}
- if(!last){renderConn(s.connection)}
- var pt=document.getElementById('peertable');
- if(s.peers&&s.peers.length){pt.innerHTML='<tr><th>Address</th><td><b>Client · direction</b></td></tr>'+s.peers.map(function(p){return '<tr><th><code>'+esc(p.addr)+'</code></th><td>'+esc(p.subver)+' · '+(p.inbound?'inbound':'outbound')+'</td></tr>'}).join('')}
- last=s;
-}
-function tick(){fetch('api/status').then(function(r){return r.json()}).then(render).catch(function(){}).then(function(){setTimeout(tick,5000)})}
-tick();
-</script></body></html>"""
+<script src="dashboard.js"></script></body></html>"""
+
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _read_file(name):
+    with open(os.path.join(APP_DIR, name), "rb") as fh:
+        return fh.read()
+
+
+# Content-Security-Policy: only our own files run, plus Trezor Connect
+# (loaded on demand when the user clicks "Connect Trezor"). No inline
+# scripts, no other origins, nothing can frame this page.
+CSP = (
+    "default-src 'self'; "
+    "script-src 'self' https://connect.trezor.io; "
+    "connect-src 'self' https://connect.trezor.io https://*.trezor.io; "
+    "frame-src https://connect.trezor.io; "
+    "img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -213,21 +204,92 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(raw)
 
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj), "application/json")
+
     def do_GET(self):  # noqa: N802
         path = self.path.split("?", 1)[0]
-        if path in ("/", "/index.html"):
-            self._send(200, PAGE, "text/html; charset=utf-8")
-        elif path == "/api/status":
-            self._send(200, json.dumps(status()), "application/json")
-        elif path == "/api/widget/stats":
-            self._send(200, json.dumps(widget_stats()), "application/json")
-        elif path == "/api/widget/sync":
-            self._send(200, json.dumps(widget_sync()), "application/json")
-        else:
-            self._send(404, "not found", "text/plain")
+        try:
+            if path in ("/", "/index.html"):
+                self._send(200, PAGE, "text/html; charset=utf-8")
+            elif path == "/wallet":
+                self._send(200, _read_file("wallet.html"), "text/html; charset=utf-8")
+            elif path == "/dashboard.js":
+                self._send(200, _read_file("dashboard.js"), "text/javascript; charset=utf-8")
+            elif path == "/wallet.js":
+                self._send(200, _read_file("wallet.js"), "text/javascript; charset=utf-8")
+            elif path == "/api/status":
+                self._json(200, status())
+            elif path == "/api/widget/stats":
+                self._json(200, widget_stats())
+            elif path == "/api/widget/sync":
+                self._json(200, widget_sync())
+            elif path == "/api/wallet/status":
+                self._json(200, wallet.status(rpc))
+            else:
+                self._send(404, "not found", "text/plain")
+        except wallet.WalletError as exc:
+            self._json(400, {"error": str(exc)})
+        except RpcError as exc:
+            self._json(503, {"error": "Node: " + str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            self._json(500, {"error": exc.__class__.__name__ + ": " + str(exc)})
+
+    def _same_origin(self):
+        """CSRF guard: fetch() from our own page sets this header and the
+        browser sets Sec-Fetch-Site. A foreign page cannot do both."""
+        if self.headers.get("X-Doge-Wallet") != "1":
+            return False
+        site = self.headers.get("Sec-Fetch-Site")
+        if site and site not in ("same-origin", "none"):
+            return False
+        origin = self.headers.get("Origin")
+        host = self.headers.get("Host", "")
+        if origin and origin.split("://", 1)[-1] != host:
+            return False
+        return True
+
+    def do_POST(self):  # noqa: N802
+        path = self.path.split("?", 1)[0]
+        if not self._same_origin():
+            self._json(403, {"error": "cross-origin request refused"})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 1_000_000:
+            self._json(413, {"error": "too large"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+            if path == "/api/wallet/import":
+                since = body.get("since")
+                self._json(200, wallet.start_import(rpc, body.get("xpub", ""), int(body.get("account", 0)), int(since) if since else None))
+            elif path == "/api/wallet/forget":
+                wallet.forget(rpc)
+                self._json(200, {"ok": True})
+            elif path == "/api/wallet/build":
+                self._json(200, wallet.build(rpc, body.get("to"), body.get("amount"), body.get("fee_per_kb"),
+                                             bool(body.get("subtract_fee")), bool(body.get("send_max"))))
+            elif path == "/api/wallet/decode":
+                self._json(200, wallet.decode(rpc, body.get("hex")))
+            elif path == "/api/wallet/broadcast":
+                self._json(200, wallet.broadcast(rpc, body.get("hex")))
+            else:
+                self._send(404, "not found", "text/plain")
+        except wallet.WalletError as exc:
+            self._json(400, {"error": str(exc)})
+        except RpcError as exc:
+            self._json(503, {"error": "Node: " + str(exc)})
+        except (ValueError, TypeError) as exc:
+            self._json(400, {"error": "bad request: " + str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            self._json(500, {"error": exc.__class__.__name__ + ": " + str(exc)})
 
     def log_message(self, fmt, *args):
         pass

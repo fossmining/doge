@@ -1,0 +1,320 @@
+"""Public-key-only BIP32 derivation for Dogecoin, pure Python stdlib.
+
+Only *public* derivation (CKDpub) is implemented. There is deliberately no
+code path that can hold, derive or import a private key: this module turns a
+Trezor account xpub into watch-only Dogecoin addresses and nothing else.
+
+Supports the standard "xpub" version bytes and Dogecoin's own "dgub" bytes as
+exported by Trezor Suite (Account -> "Show public key (XPUB)").
+"""
+
+import hashlib
+import hmac
+import struct
+
+# --- secp256k1 -----------------------------------------------------------
+
+P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+G = (
+    0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+    0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8,
+)
+
+
+def _inv(a):
+    return pow(a, P - 2, P)
+
+
+def _add(p1, p2):
+    if p1 is None:
+        return p2
+    if p2 is None:
+        return p1
+    x1, y1 = p1
+    x2, y2 = p2
+    if x1 == x2:
+        if (y1 + y2) % P == 0:
+            return None
+        lam = (3 * x1 * x1) * _inv(2 * y1) % P
+    else:
+        lam = (y2 - y1) * _inv(x2 - x1) % P
+    x3 = (lam * lam - x1 - x2) % P
+    y3 = (lam * (x1 - x3) - y1) % P
+    return (x3, y3)
+
+
+def _mul(k, point):
+    result = None
+    addend = point
+    while k:
+        if k & 1:
+            result = _add(result, addend)
+        addend = _add(addend, addend)
+        k >>= 1
+    return result
+
+
+def _compress(point):
+    x, y = point
+    return bytes([2 + (y & 1)]) + x.to_bytes(32, "big")
+
+
+def _decompress(data):
+    if len(data) != 33 or data[0] not in (2, 3):
+        raise ValueError("bad compressed public key")
+    x = int.from_bytes(data[1:], "big")
+    y_sq = (pow(x, 3, P) + 7) % P
+    y = pow(y_sq, (P + 1) // 4, P)
+    if (y * y) % P != y_sq:
+        raise ValueError("public key not on curve")
+    if (y & 1) != (data[0] & 1):
+        y = P - y
+    return (x, y)
+
+
+# --- hashes --------------------------------------------------------------
+
+def sha256(b):
+    return hashlib.sha256(b).digest()
+
+
+def _ripemd160_py(message):
+    """Pure-Python RIPEMD-160 (used when OpenSSL has it disabled)."""
+    rl = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+          7, 4, 13, 1, 10, 6, 15, 3, 12, 0, 9, 5, 2, 14, 11, 8,
+          3, 10, 14, 4, 9, 15, 8, 1, 2, 7, 0, 6, 13, 11, 5, 12,
+          1, 9, 11, 10, 0, 8, 12, 4, 13, 3, 7, 15, 14, 5, 6, 2,
+          4, 0, 5, 9, 7, 12, 2, 10, 14, 1, 3, 8, 11, 6, 15, 13]
+    rr = [5, 14, 7, 0, 9, 2, 11, 4, 13, 6, 15, 8, 1, 10, 3, 12,
+          6, 11, 3, 7, 0, 13, 5, 10, 14, 15, 8, 12, 4, 9, 1, 2,
+          15, 5, 1, 3, 7, 14, 6, 9, 11, 8, 12, 2, 10, 0, 4, 13,
+          8, 6, 4, 1, 3, 11, 15, 0, 5, 12, 2, 13, 9, 7, 10, 14,
+          12, 15, 10, 4, 1, 5, 8, 7, 6, 2, 13, 14, 0, 3, 9, 11]
+    sl = [11, 14, 15, 12, 5, 8, 7, 9, 11, 13, 14, 15, 6, 7, 9, 8,
+          7, 6, 8, 13, 11, 9, 7, 15, 7, 12, 15, 9, 11, 7, 13, 12,
+          11, 13, 6, 7, 14, 9, 13, 15, 14, 8, 13, 6, 5, 12, 7, 5,
+          11, 12, 14, 15, 14, 15, 9, 8, 9, 14, 5, 6, 8, 6, 5, 12,
+          9, 15, 5, 11, 6, 8, 13, 12, 5, 12, 13, 14, 11, 8, 5, 6]
+    sr = [8, 9, 9, 11, 13, 15, 15, 5, 7, 7, 8, 11, 14, 14, 12, 6,
+          9, 13, 15, 7, 12, 8, 9, 11, 7, 7, 12, 7, 6, 15, 13, 11,
+          9, 7, 15, 11, 8, 6, 6, 14, 12, 13, 5, 14, 13, 13, 7, 5,
+          15, 5, 8, 11, 14, 14, 6, 14, 6, 9, 12, 9, 12, 5, 15, 8,
+          8, 5, 12, 9, 12, 5, 14, 6, 8, 13, 6, 5, 15, 13, 11, 11]
+    kl = [0x00000000, 0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xA953FD4E]
+    kr = [0x50A28BE6, 0x5C4DD124, 0x6D703EF3, 0x7A6D76E9, 0x00000000]
+
+    def f(j, x, y, z):
+        if j < 16:
+            return x ^ y ^ z
+        if j < 32:
+            return (x & y) | (~x & z)
+        if j < 48:
+            return (x | ~y) ^ z
+        if j < 64:
+            return (x & z) | (y & ~z)
+        return x ^ (y | ~z)
+
+    def rol(x, n):
+        return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF
+
+    h = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0]
+    msg = bytearray(message)
+    ml = len(message) * 8
+    msg.append(0x80)
+    while len(msg) % 64 != 56:
+        msg.append(0)
+    msg += struct.pack("<Q", ml)
+    for off in range(0, len(msg), 64):
+        x = list(struct.unpack("<16I", msg[off:off + 64]))
+        al, bl, cl, dl, el = h
+        ar, br, cr, dr, er = h
+        for j in range(80):
+            t = rol((al + f(j, bl, cl, dl) + x[rl[j]] + kl[j // 16]) & 0xFFFFFFFF, sl[j])
+            t = (t + el) & 0xFFFFFFFF
+            al, el, dl, cl, bl = el, dl, rol(cl, 10), bl, t
+            t = rol((ar + f(79 - j, br, cr, dr) + x[rr[j]] + kr[j // 16]) & 0xFFFFFFFF, sr[j])
+            t = (t + er) & 0xFFFFFFFF
+            ar, er, dr, cr, br = er, dr, rol(cr, 10), br, t
+        t = (h[1] + cl + dr) & 0xFFFFFFFF
+        h[1] = (h[2] + dl + er) & 0xFFFFFFFF
+        h[2] = (h[3] + el + ar) & 0xFFFFFFFF
+        h[3] = (h[4] + al + br) & 0xFFFFFFFF
+        h[4] = (h[0] + bl + cr) & 0xFFFFFFFF
+        h[0] = t
+    return struct.pack("<5I", *h)
+
+
+def ripemd160(b):
+    try:
+        return hashlib.new("ripemd160", b).digest()
+    except (ValueError, TypeError):
+        return _ripemd160_py(b)
+
+
+def hash160(b):
+    return ripemd160(sha256(b))
+
+
+# --- base58check ---------------------------------------------------------
+
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def b58encode(raw):
+    n = int.from_bytes(raw, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = _B58[r] + out
+    pad = len(raw) - len(raw.lstrip(b"\0"))
+    return "1" * pad + out
+
+
+def b58decode(s):
+    n = 0
+    for ch in s:
+        if ch not in _B58:
+            raise ValueError("invalid base58 character")
+        n = n * 58 + _B58.index(ch)
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    pad = len(s) - len(s.lstrip("1"))
+    return b"\0" * pad + raw
+
+
+def b58check_encode(raw):
+    return b58encode(raw + sha256(sha256(raw))[:4])
+
+
+def b58check_decode(s):
+    raw = b58decode(s.strip())
+    if len(raw) < 5:
+        raise ValueError("too short")
+    body, chk = raw[:-4], raw[-4:]
+    if sha256(sha256(body))[:4] != chk:
+        raise ValueError("bad checksum")
+    return body
+
+
+# --- Dogecoin constants --------------------------------------------------
+
+DOGE_P2PKH = 0x1E           # addresses start with "D"
+DOGE_P2SH = 0x16            # addresses start with "9" or "A"
+XPUB_VERSIONS = {
+    0x0488B21E: "xpub",      # generic BIP32
+    0x02FACAFD: "dgub",      # Dogecoin
+}
+XPRV_VERSIONS = {0x0488ADE4, 0x02FAC398}
+COIN_TYPE = 3               # SLIP-44 Dogecoin
+PURPOSE = 44
+
+
+class Xpub:
+    __slots__ = ("depth", "fingerprint", "child", "chain", "point", "version")
+
+    def __init__(self, s):
+        body = b58check_decode(s)
+        if len(body) != 78:
+            raise ValueError("not an extended key")
+        version = int.from_bytes(body[:4], "big")
+        if version in XPRV_VERSIONS:
+            raise ValueError("That is a PRIVATE key (xprv/dgpv). Never paste it anywhere. Use the public xpub/dgub.")
+        if version not in XPUB_VERSIONS:
+            raise ValueError("unknown extended key version")
+        self.version = version
+        self.depth = body[4]
+        self.fingerprint = body[5:9]
+        self.child = int.from_bytes(body[9:13], "big")
+        self.chain = body[13:45]
+        self.point = _decompress(body[45:78])
+
+    @classmethod
+    def _from_parts(cls, depth, fingerprint, child, chain, point, version):
+        obj = cls.__new__(cls)
+        obj.depth, obj.fingerprint, obj.child = depth, fingerprint, child
+        obj.chain, obj.point, obj.version = chain, point, version
+        return obj
+
+    def pubkey(self):
+        return _compress(self.point)
+
+    def own_fingerprint(self):
+        return hash160(self.pubkey())[:4]
+
+    def derive(self, index):
+        if index >= 0x80000000:
+            raise ValueError("hardened derivation impossible from a public key")
+        data = self.pubkey() + struct.pack(">I", index)
+        i = hmac.new(self.chain, data, hashlib.sha512).digest()
+        il = int.from_bytes(i[:32], "big")
+        if il >= N:
+            raise ValueError("invalid child (try next index)")
+        point = _add(_mul(il, G), self.point)
+        if point is None:
+            raise ValueError("invalid child (try next index)")
+        return Xpub._from_parts(self.depth + 1, self.own_fingerprint(), index, i[32:], point, self.version)
+
+    def serialize(self, version=None):
+        version = self.version if version is None else version
+        raw = (
+            version.to_bytes(4, "big") + bytes([self.depth]) + self.fingerprint
+            + struct.pack(">I", self.child) + self.chain + self.pubkey()
+        )
+        return b58check_encode(raw)
+
+    def address(self):
+        return b58check_encode(bytes([DOGE_P2PKH]) + hash160(self.pubkey()))
+
+
+def derive_address(account_xpub, change, index):
+    """Return (address, compressed pubkey hex) for m/.../change/index."""
+    child = account_xpub.derive(change).derive(index)
+    return child.address(), child.pubkey().hex()
+
+
+def bip44_path(account, change, index):
+    """Trezor address_n for Dogecoin: m/44'/3'/account'/change/index."""
+    h = 0x80000000
+    return [PURPOSE | h, COIN_TYPE | h, account | h, change, index]
+
+
+def validate_doge_address(addr):
+    """Returns (kind, hash160 bytes). Raises ValueError if not a mainnet Dogecoin address."""
+    body = b58check_decode(addr)
+    if len(body) != 21:
+        raise ValueError("wrong length")
+    if body[0] == DOGE_P2PKH:
+        return "p2pkh", body[1:]
+    if body[0] == DOGE_P2SH:
+        return "p2sh", body[1:]
+    raise ValueError("not a Dogecoin mainnet address")
+
+
+if __name__ == "__main__":
+    # BIP32 test vector 2: m -> m/0 (public derivation)
+    master = Xpub("xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB")
+    child = master.derive(0)
+    assert child.serialize() == "xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH", child.serialize()
+    # m/0/2147483647' is hardened and must be refused
+    try:
+        child.derive(2147483647 + 0x80000000)
+        raise SystemExit("hardened derivation should fail")
+    except ValueError:
+        pass
+    # RIPEMD-160 known answer
+    assert _ripemd160_py(b"abc").hex() == "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc"
+    assert _ripemd160_py(b"").hex() == "9c1185a5c5e9fc54612808977ee8f548b2258d31"
+    assert ripemd160(b"abc").hex() == "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc"
+    # Dogecoin address round trip + xprv refusal
+    addr = child.address()
+    assert addr.startswith("D"), addr
+    assert validate_doge_address(addr)[0] == "p2pkh"
+    try:
+        Xpub("xprv9s21ZrQH143K31xYSDQpPDxsXRTUcvj2iNHm5NUtrGiGG5e2DtALGdso3pGz6ssrdK4PFmM8NSpSBHNqPqm55Qn3LqFtT2emdEXVYsCzC2U")
+        raise SystemExit("xprv should be refused")
+    except ValueError as exc:
+        assert "PRIVATE" in str(exc)
+    # dgub re-serialisation preserves Dogecoin version bytes
+    dg = Xpub(master.serialize(0x02FACAFD))
+    assert dg.serialize().startswith("dgub"), dg.serialize()
+    print("walletkeys self-test OK:", addr)

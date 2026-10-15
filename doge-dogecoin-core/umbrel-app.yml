@@ -4,8 +4,8 @@ storage:
   dataRoot: data
 category: crypto
 name: Dogecoin Core
-version: "1.14.9"
-tagline: Run your own Dogecoin full node
+version: "1.15.0"
+tagline: Dogecoin full node with a watch-only Trezor wallet
 icon: https://raw.githubusercontent.com/dogecoin/dogecoin/master/share/pixmaps/dogecoin256.png
 description: >-
   Run your own Dogecoin full node with the official Dogecoin Core 1.14.9
@@ -23,10 +23,23 @@ description: >-
   and the RPC and ZMQ details other apps on your Umbrel can use to connect.
 
 
+  The Wallet page turns the node into a watch-only wallet for a Trezor
+  Dogecoin account: paste the account's public key (xpub/dgub) from Trezor
+  Suite and the node tracks balances and history without ever holding a
+  private key. Transactions are built from the node's own coin data, signed
+  on the Trezor (through Trezor Suite's Bridge or WebUSB) with the referenced
+  transactions supplied by the node, and broadcast by the node, so no
+  third-party server learns your addresses. An air-gapped signing path is
+  included for other signers.
+
+
   Initial sync downloads the full Dogecoin blockchain (well over 100 GB) and
   can take a day or more. An SSD is strongly recommended. Forward TCP port
   22556 on your router if you want inbound peers.
-releaseNotes: ""
+releaseNotes: >-
+  Adds a watch-only Trezor wallet page (Dogecoin Core itself stays at
+  1.14.9). Strict Content-Security-Policy on the dashboard; node wallet
+  started with keypool=1 since it never holds spendable keys.
 
 developer: Dogecoin Core developers
 website: https://dogecoin.com

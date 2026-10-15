@@ -1,6 +1,6 @@
 # Dogecoin Umbrel App Store
 
-Community app store for umbrelOS with one app: **Dogecoin Core 1.14.9** (`doge-dogecoin-core`).
+Community app store for umbrelOS with one app: **Dogecoin Core 1.14.9 + watch-only Trezor wallet** (`doge-dogecoin-core`, app version 1.15.0).
 
 ## What the app does
 
@@ -9,7 +9,40 @@ Community app store for umbrelOS with one app: **Dogecoin Core 1.14.9** (`doge-d
   value pinned from the PGP-signed `SHA256SUMS.asc`. Supports `x86_64` and `aarch64`.
 - `dogecoind` runs the official binary from `data/bin`, with chain data in `data/dogecoin`.
 - `web` serves a status dashboard (sync, peers, mempool, RPC/ZMQ connection details)
-  on the Umbrel app port **22580**, plus two home-screen widgets.
+  on the Umbrel app port **22580**, plus two home-screen widgets, and the **Wallet** page
+  (`/wallet`) described below.
+
+## Wallet page (watch-only, Trezor signing)
+
+The wallet page turns the node into a watch-only wallet for one Trezor Dogecoin account.
+Design goal: the Umbrel never holds a private key, and no third party learns your addresses.
+
+| Step | Where it happens | What leaves your Umbrel |
+|---|---|---|
+| Link account | Trezor Suite → account → ⋯ → *Show public key (XPUB)*; paste `dgub…`/`xpub…` into **Setup** | nothing |
+| Watch balances/history | node imports the first 20 receive + 20 change addresses as **watch-only** (`importmulti`, gap limit maintained automatically) | nothing |
+| Receive | next unused address shown, with **Show & verify on Trezor** (device displays it) | nothing |
+| Send | node selects coins, builds the unsigned tx and the referenced previous txs; **Trezor Connect** (loaded from connect.trezor.io only when you click) has the device sign it; node broadcasts | the signing request to the Trezor (via Suite's Bridge or WebUSB). Trezor's Blockbook is *not* consulted because refTxs come from the node |
+| Air-gapped alternative | download unsigned JSON, sign elsewhere, paste signed hex in **Broadcast** (decoded and shown before sending) | nothing |
+
+Hardening in `dashboard.py`: strict `Content-Security-Policy` (only own files + connect.trezor.io),
+no inline scripts, `X-Frame-Options: DENY`, every POST requires a custom header and a same-origin
+`Sec-Fetch-Site`/`Origin`, private extended keys (`xprv`/`dgpv`) are refused on sight, and the UI
+warns if the node's own wallet ever holds spendable coins. The page is only reachable through
+Umbrel's login. Before signing, the page checks the connected device's account xpub matches the
+linked one (catches wrong device / wrong passphrase).
+
+The only wallet state on disk is `data/walletui/account.json` (public key + derived addresses).
+Dogecoin Core 1.14 cannot un-import watch-only addresses, so *Forget account* only removes that file.
+
+Trezor Connect needs either Trezor Suite running (its bundled Bridge) or a Chromium browser
+(WebUSB). Firefox needs Suite/Bridge. Dogecoin uses legacy P2PKH, path `m/44'/3'/account'`.
+
+### Size
+
+The wallet adds about **58 KB** of Python/HTML/JS (whole UI incl. dashboard: ~75 KB; whole app
+folder: ~110 KB) and no extra containers or images. The download for a new node is still the
+Dogecoin blockchain itself.
 
 | | |
 |---|---|
