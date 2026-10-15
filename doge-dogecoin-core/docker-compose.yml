@@ -59,8 +59,7 @@ services:
       default:
         ipv4_address: ${APP_DOGECOIN_NODE_IP}
     ports:
-      # Dogecoin P2P. Forward this on your router for inbound clearnet peers
-      # (not needed for .onion peers; unused in tor-only mode).
+      # Dogecoin P2P. Forward this on your router for inbound peers.
       - "22556:22556/tcp"
 
   tor:
@@ -94,7 +93,6 @@ services:
       ZMQ_RAWBLOCK_PORT: ${APP_DOGECOIN_ZMQ_RAWBLOCK_PORT}
       ZMQ_RAWTX_PORT: ${APP_DOGECOIN_ZMQ_RAWTX_PORT}
       DEVICE_DOMAIN_NAME: ${DEVICE_DOMAIN_NAME}
-      P2P_ONION: ${APP_DOGECOIN_P2P_HIDDEN_SERVICE}
       RPC_ONION: ${APP_DOGECOIN_RPC_HIDDEN_SERVICE}
       TOR_MODE: ${APP_DOGECOIN_TOR_MODE}
     volumes:

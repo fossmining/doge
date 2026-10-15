@@ -4,7 +4,7 @@ storage:
   dataRoot: data
 category: crypto
 name: Dogecoin Core
-version: "1.19.1"
+version: "1.19.2"
 tagline: Dogecoin full node with a watch-only Trezor wallet
 icon: https://raw.githubusercontent.com/dogecoin/dogecoin/master/share/pixmaps/dogecoin256.png
 description: >-
@@ -44,22 +44,20 @@ description: >-
   data, MyDoge signs in its popup, the node broadcasts.
 
 
-  Tor is built in, like the Umbrel Bitcoin and Monero apps: all outbound
-  peer connections go through a private Tor container, the node is reachable
-  on its own .onion (shown on the dashboard, with an RPC .onion for remote
-  wallets), and a one-click "Tor-only" mode restricts it to .onion peers so
-  no clearnet peer can tie your IP to the transactions you broadcast.
+  Tor is built in: all outbound peer connections and transaction broadcasts
+  go through a private Tor container, so peers see a Tor exit instead of your
+  IP, and an RPC .onion lets remote wallets reach the node over Tor. (Dogecoin
+  Core 1.14 cannot use v3 .onion peers, so inbound stays on the clearnet port.)
 
 
   Initial sync downloads the full Dogecoin blockchain (well over 100 GB) and
   can take a day or more. An SSD is strongly recommended. Forward TCP port
   22556 on your router if you want inbound peers.
 releaseNotes: >-
-  Tor: outbound connections now go through a bundled Tor container, the
-  node gets P2P and RPC hidden services, and the dashboard shows Tor status
-  with a Tor-only switch. The node now has a fixed address on the Umbrel
-  network (10.21.21.231); apps that connected by container name keep
-  working.
+  Fixes 1.19.x start-up failure: Dogecoin Core 1.14 cannot parse v3 .onion
+  addresses, so the P2P hidden service and Tor-only mode are removed.
+  Outbound connections and broadcasts still go through Tor; the RPC .onion
+  remains.
 
 developer: fossmining
 website: https://dogecoin.com

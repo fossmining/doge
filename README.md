@@ -1,6 +1,6 @@
 # Dogecoin Umbrel App Store
 
-Community app store for umbrelOS with one app: **Dogecoin Core 1.14.9 + watch-only Trezor wallet** (`doge-dogecoin-core`, app version 1.19.0).
+Community app store for umbrelOS with one app: **Dogecoin Core 1.14.9 + watch-only Trezor wallet** (`doge-dogecoin-core`, app version 1.19.2).
 
 ## What the app does
 
@@ -80,19 +80,15 @@ third-party Dogecoin image is trusted.
 
 ## Tor
 
-Same pattern as the official Bitcoin and Monero apps: a `tor` container (Umbrel's image) with
-`torrc.template` defining two hidden services, and `dogecoind` started with
-`-proxy=<tor>:9050 -onion=<tor>:9050 -discover=0 -externalip=<p2p onion>`. `hooks/pre-start`
-waits for the hidden-service hostname on first start.
+A `tor` container (Umbrel's image) runs alongside the node and `dogecoind` starts with
+`-proxy=<tor>:9050`, so every outbound peer connection and every transaction broadcast leaves
+through Tor; peers see a Tor exit, not your IP. `torrc.template` also defines an RPC hidden service
+for remote wallets/explorers (shown on the dashboard under *Privacy (Tor)*).
 
-| | |
-|---|---|
-| Default mode | all outbound through Tor; inbound on the .onion **and** on clearnet `22556` |
-| Tor-only | adds `-onlynet=onion`; no clearnet peers at all (fewer peers, strongest privacy) |
-| Switch | dashboard → *Privacy (Tor)* → button, then restart the app (`data/walletui/tor.json`) |
-| Onions | shown on the dashboard: P2P (`addnode` for other nodes) and RPC (remote wallets) |
-
-Because Tor needs an IP as hidden-service target, `dogecoind` now has a fixed address
+Not possible on Dogecoin Core 1.14: an inbound `.onion` listener or a Tor-only mode. 1.14 only
+understands v2 onion addresses, which Tor no longer issues, so a v3 onion can't be advertised
+(`-externalip` fails at start-up) and other 1.14 nodes couldn't dial it. Inbound stays on clearnet
+`22556`. Because Tor needs an IP as hidden-service target, `dogecoind` has the fixed address
 `10.21.21.231` and the Tor container `10.21.21.232` on the Umbrel network.
 
 ## Install

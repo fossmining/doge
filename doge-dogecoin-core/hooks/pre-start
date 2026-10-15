@@ -3,7 +3,7 @@
 # Delay booting dogecoind until the Tor hidden services exist, so the
 # node can advertise its .onion from the first start.
 
-HIDDEN_SERVICE_FILE="${TOR_DATA_DIR}/app-${APP_ID}-p2p/hostname"
+HIDDEN_SERVICE_FILE="${TOR_DATA_DIR}/app-${APP_ID}-rpc/hostname"
 
 if [[ -f "${HIDDEN_SERVICE_FILE}" ]]; then
 	exit
