@@ -1,6 +1,6 @@
 # Dogecoin Umbrel App Store
 
-Community app store for umbrelOS with one app: **Dogecoin Core 1.14.9 + watch-only Trezor wallet** (`doge-dogecoin-core`, app version 1.16.0).
+Community app store for umbrelOS with one app: **Dogecoin Core 1.14.9 + watch-only Trezor wallet** (`doge-dogecoin-core`, app version 1.17.0).
 
 ## What the app does
 
@@ -24,6 +24,15 @@ Design goal: the Umbrel never holds a private key, and no third party learns you
 | Receive | next unused address shown, with **Show & verify on Trezor** (device displays it) | nothing |
 | Send | node selects coins, builds the unsigned tx and the referenced previous txs; **Trezor Connect** (loaded from connect.trezor.io only when you click) has the device sign it; node broadcasts | the signing request to the Trezor (via Suite's Bridge or WebUSB). Trezor's Blockbook is *not* consulted because refTxs come from the node |
 | Air-gapped alternative | download unsigned JSON, sign elsewhere, paste signed hex in **Broadcast** (decoded and shown before sending) | nothing |
+
+### MyDoge extension (optional third signing source)
+
+For the self-custodial [MyDoge](https://www.mydoge.com) browser extension (Chrome/Chromium). *Wallet → MyDoge →
+Connect*: the extension's `connect()` shares its address and public key; the node checks the key hashes to the
+address, imports the address watch-only (`importmulti` with a rescan from 2023-01-01 or the date you give) and
+tracks balance/history itself. Sending: *Spend from: MyDoge*, same review flow, then `requestPsbt({signOnly})`
+signs inside the extension popup, the page re-decodes the result, and the node broadcasts. MyDoge's servers
+are not used for balances or broadcasting. Change goes back to the same address (MyDoge is single-address).
 
 ### Node wallet mode (optional second signing source)
 

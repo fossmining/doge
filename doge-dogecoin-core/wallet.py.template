@@ -225,6 +225,7 @@ def status(rpc):
         "fee": {"default_per_kb": str(DEFAULT_FEE_PER_KB), "min_per_kb": str(MIN_FEE_PER_KB), "dust": str(DUST)},
     }
     out["node"] = node_status(rpc)
+    out["mydoge"] = mydoge_status(rpc)
     if not state:
         return out
     xp = wk.Xpub(state["xpub"])
@@ -314,9 +315,16 @@ def _ref_tx(rpc, txid):
 
 
 def build(rpc, to_address, amount, fee_per_kb=None, subtract_fee=False, send_max=False, source="trezor"):
-    if source not in ("trezor", "node"):
+    if source not in ("trezor", "node", "mydoge"):
         raise WalletError("Unknown signing source")
     state = load_state()
+    md = None
+    if source == "mydoge":
+        md = _mydoge_cfg()
+        if not md:
+            raise WalletError("No MyDoge wallet connected")
+        if _rescan["running"]:
+            raise WalletError("Rescan still running")
     if source == "trezor":
         if not state:
             raise WalletError("No Trezor account imported")
@@ -342,6 +350,8 @@ def build(rpc, to_address, amount, fee_per_kb=None, subtract_fee=False, send_max
 
     if source == "trezor":
         utxos = [u for u in _our_utxos(rpc, state) if u["confirmations"] > 0]
+    elif source == "mydoge":
+        utxos = [u for u in _mydoge_utxos(rpc, md) if u["confirmations"] > 0]
     else:
         utxos = [u for u in _node_utxos(rpc) if u["confirmations"] > 0]
     if not utxos:
@@ -392,8 +402,8 @@ def build(rpc, to_address, amount, fee_per_kb=None, subtract_fee=False, send_max
     outputs = [{"address": to_address, "amount": _koinu(amount), "script_type": "PAYTOADDRESS"}]
     rpc_outputs = {to_address: float(_q(amount))}
     change_info = None
-    if change > 0 and source == "node":
-        caddr = rpc("getrawchangeaddress")
+    if change > 0 and source in ("node", "mydoge"):
+        caddr = rpc("getrawchangeaddress") if source == "node" else md["address"]
         change_info = {"address": caddr, "index": None, "amount": _s(change)}
         outputs.append({"address": caddr, "amount": _koinu(change), "script_type": "PAYTOADDRESS"})
         rpc_outputs[caddr] = float(_q(change))
@@ -445,6 +455,10 @@ def decode(rpc, hexstr):
         raise WalletError("Cannot decode: " + str(exc))
     state = load_state()
     amap = _addr_map(state) if state else {}
+    md = _mydoge_cfg()
+    if md:
+        amap = dict(amap)
+        amap[md["address"]] = ("mydoge", 0)
     outs = []
     for o in d["vout"]:
         addrs = o.get("scriptPubKey", {}).get("addresses", [])
@@ -653,3 +667,123 @@ def backup_path(name):
     if not os.path.isfile(path):
         raise WalletError("backup not found")
     return path
+
+
+# --- MyDoge browser extension (third signing source) --------------------------
+#
+# The extension (window.doge) holds the keys in the user's browser. This node
+# watches the connected address (watch-only import), builds spends from its
+# own UTXO data, hands the raw tx to the extension's requestPsbt(signOnly)
+# and broadcasts the signed result itself.
+
+MYDOGE_FILE = os.path.join(STATE_DIR, "mydoge.json")
+MYDOGE_LABEL = "mydoge-watchonly"
+MYDOGE_EPOCH = 1672531200  # 2023-01-01: before the extension existed
+
+
+def _mydoge_cfg():
+    try:
+        with open(MYDOGE_FILE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def mydoge_connect(rpc, address, pubkey, since_ts=None):
+    """Called after window.doge.connect(): verify the public key really
+    hashes to the address, then watch it. Rescans in the background."""
+    address = (address or "").strip()
+    pubkey = (pubkey or "").strip().lower()
+    try:
+        kind, h160 = wk.validate_doge_address(address)
+    except ValueError as exc:
+        raise WalletError("MyDoge returned an invalid address (" + str(exc) + ")")
+    if kind != "p2pkh":
+        raise WalletError("MyDoge address is not P2PKH")
+    if pubkey:
+        try:
+            pk = bytes.fromhex(pubkey)
+        except ValueError:
+            raise WalletError("MyDoge returned a malformed public key")
+        if len(pk) not in (33, 65) or wk.hash160(pk) != h160:
+            raise WalletError("MyDoge public key does not match its address; refusing")
+    with _lock:
+        if _rescan["running"]:
+            raise WalletError("A rescan is already running")
+        old = _mydoge_cfg()
+        if old and old["address"] == address:
+            return {"rescan": False, "already": True}
+        cfg = {"address": address, "pubkey": pubkey, "since": int(since_ts or MYDOGE_EPOCH), "created": int(time.time())}
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = MYDOGE_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(cfg, fh)
+        os.replace(tmp, MYDOGE_FILE)
+        _rescan.update(running=True, started=time.time(), error=None)
+
+    def job():
+        try:
+            reqs = [{"scriptPubKey": {"address": address}, "timestamp": cfg["since"], "watchonly": True, "label": MYDOGE_LABEL}]
+            res = rpc("importmulti", [reqs, {"rescan": True}], timeout=None)
+            if not res or not res[0].get("success"):
+                _rescan["error"] = "importmulti failed: " + json.dumps((res or [{}])[0].get("error", {}))[:200]
+        except Exception as exc:  # noqa: BLE001
+            _rescan["error"] = str(exc)
+        finally:
+            _rescan["running"] = False
+
+    threading.Thread(target=job, daemon=True).start()
+    return {"rescan": True}
+
+
+def mydoge_forget():
+    with _lock:
+        if _rescan["running"]:
+            raise WalletError("Wait for the rescan to finish")
+        try:
+            os.remove(MYDOGE_FILE)
+        except OSError:
+            pass
+
+
+def _mydoge_utxos(rpc, md):
+    utxos = []
+    for u in rpc("listunspent", [0, 9999999, [md["address"]]]):
+        if u.get("address") != md["address"] or u.get("spendable"):
+            continue
+        utxos.append({"txid": u["txid"], "vout": u["vout"], "address": u["address"],
+                      "amount": _s(u["amount"]), "confirmations": u.get("confirmations", 0),
+                      "change": None, "index": None})
+    return utxos
+
+
+def mydoge_status(rpc):
+    md = _mydoge_cfg()
+    if not md:
+        return {"connected": False}
+    out = {"connected": True, "address": md["address"], "pubkey": md.get("pubkey"), "since": md["since"]}
+    if _rescan["running"]:
+        return out
+    try:
+        utxos = _mydoge_utxos(rpc, md)
+        out["balance"] = {"confirmed": _s(sum(Decimal(u["amount"]) for u in utxos if u["confirmations"] > 0)),
+                          "unconfirmed": _s(sum(Decimal(u["amount"]) for u in utxos if u["confirmations"] == 0))}
+        out["utxos"] = utxos
+        rows = rpc("listtransactions", ["*", 200, 0, True])
+        by = {}
+        for r in rows:
+            if r.get("address") != md["address"]:
+                continue
+            t = by.setdefault(r["txid"], {"txid": r["txid"], "time": r.get("time"), "confirmations": r.get("confirmations", 0),
+                                          "received": Decimal(0), "sent": Decimal(0), "fee": Decimal(0)})
+            amt = _q(r.get("amount", 0))
+            if r.get("category") == "receive":
+                t["received"] += amt
+            elif r.get("category") == "send":
+                t["sent"] += -amt
+        out["transactions"] = [{"txid": t["txid"], "time": t["time"], "confirmations": t["confirmations"],
+                                "net": _s(t["received"] - t["sent"]), "fee": "0.00000000"}
+                               for t in sorted(by.values(), key=lambda t: (t["time"] or 0), reverse=True)]
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = str(exc)
+    return out

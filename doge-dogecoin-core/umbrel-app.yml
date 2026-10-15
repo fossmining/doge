@@ -4,7 +4,7 @@ storage:
   dataRoot: data
 category: crypto
 name: Dogecoin Core
-version: "1.16.0"
+version: "1.17.0"
 tagline: Dogecoin full node with a watch-only Trezor wallet
 icon: https://raw.githubusercontent.com/dogecoin/dogecoin/master/share/pixmaps/dogecoin256.png
 description: >-
@@ -39,14 +39,18 @@ description: >-
   and locked again, and encrypted backups can be downloaded from the page.
 
 
+  MyDoge browser-extension support: connect the self-custodial MyDoge
+  extension, the node watches its address and builds spends from its own
+  data, MyDoge signs in its popup, the node broadcasts.
+
+
   Initial sync downloads the full Dogecoin blockchain (well over 100 GB) and
   can take a day or more. An SSD is strongly recommended. Forward TCP port
   22556 on your router if you want inbound peers.
 releaseNotes: >-
-  Adds Node wallet mode (encrypted wallet.dat on the node, passphrase per
-  send, same review-before-broadcast flow) as a second signing option next
-  to the Trezor; encrypted wallet backups downloadable from the Wallet page.
-  dogecoind now restarts automatically after encryptwallet.
+  Adds the MyDoge browser extension as a third signing source next to the
+  Trezor and Node wallet modes (watch-only on the node, signed in the
+  extension via requestPsbt, broadcast by the node).
 
 developer: Dogecoin Core developers
 website: https://dogecoin.com
