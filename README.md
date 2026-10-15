@@ -1,6 +1,6 @@
 # Dogecoin Umbrel App Store
 
-Community app store for umbrelOS with one app: **Dogecoin Core 1.14.9 + watch-only Trezor wallet** (`doge-dogecoin-core`, app version 1.15.1).
+Community app store for umbrelOS with one app: **Dogecoin Core 1.14.9 + watch-only Trezor wallet** (`doge-dogecoin-core`, app version 1.16.0).
 
 ## What the app does
 
@@ -24,6 +24,21 @@ Design goal: the Umbrel never holds a private key, and no third party learns you
 | Receive | next unused address shown, with **Show & verify on Trezor** (device displays it) | nothing |
 | Send | node selects coins, builds the unsigned tx and the referenced previous txs; **Trezor Connect** (loaded from connect.trezor.io only when you click) has the device sign it; node broadcasts | the signing request to the Trezor (via Suite's Bridge or WebUSB). Trezor's Blockbook is *not* consulted because refTxs come from the node |
 | Air-gapped alternative | download unsigned JSON, sign elsewhere, paste signed hex in **Broadcast** (decoded and shown before sending) | nothing |
+
+### Node wallet mode (optional second signing source)
+
+For people without a Trezor. Keys live in the node's own `wallet.dat`, which **must be encrypted**
+first (Wallet → Node wallet → Encrypt; dogecoind restarts once). Then:
+
+- Send: pick *Spend from: Node wallet*. Same build → review → sign → decode-check → broadcast flow;
+  the passphrase is entered per send, the wallet is unlocked for ~20 s, `signrawtransaction` runs,
+  and the wallet is locked again in a `finally`. The passphrase is never stored.
+- Receive: a labelled node address, reused until it has received something.
+- Backup: *Create & download backup* runs `backupwallet` into `data/dogecoin/backups/` and
+  serves the (encrypted) file for download. No passphrase, no coins.
+- The page warns if the node wallet holds spendable coins while the mode is *not* enabled.
+
+This is a hot wallet secured by your passphrase and your Umbrel; keep savings on the Trezor side.
 
 Hardening in `dashboard.py`: strict `Content-Security-Policy` (only own files + connect.trezor.io),
 no inline scripts, `X-Frame-Options: DENY`, every POST requires a custom header and a same-origin

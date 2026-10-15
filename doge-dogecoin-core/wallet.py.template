@@ -224,12 +224,7 @@ def status(rpc):
         "gap_limit": GAP_LIMIT,
         "fee": {"default_per_kb": str(DEFAULT_FEE_PER_KB), "min_per_kb": str(MIN_FEE_PER_KB), "dust": str(DUST)},
     }
-    try:
-        info = rpc("getwalletinfo")
-        hot = Decimal(str(info.get("balance", 0))) + Decimal(str(info.get("unconfirmed_balance", 0)))
-        out["hot_balance"] = _s(hot)  # spendable funds in the node wallet: should always be 0
-    except Exception:  # noqa: BLE001
-        out["hot_balance"] = None
+    out["node"] = node_status(rpc)
     if not state:
         return out
     xp = wk.Xpub(state["xpub"])
@@ -318,12 +313,21 @@ def _ref_tx(rpc, txid):
     }
 
 
-def build(rpc, to_address, amount, fee_per_kb=None, subtract_fee=False, send_max=False):
+def build(rpc, to_address, amount, fee_per_kb=None, subtract_fee=False, send_max=False, source="trezor"):
+    if source not in ("trezor", "node"):
+        raise WalletError("Unknown signing source")
     state = load_state()
-    if not state:
-        raise WalletError("No account imported")
-    if _rescan["running"]:
-        raise WalletError("Rescan still running")
+    if source == "trezor":
+        if not state:
+            raise WalletError("No Trezor account imported")
+        if _rescan["running"]:
+            raise WalletError("Rescan still running")
+    else:
+        ns = node_status(rpc)
+        if not ns.get("enabled"):
+            raise WalletError("Node wallet mode is not enabled")
+        if not ns.get("encrypted"):
+            raise WalletError("Node wallet is not encrypted")
     to_address = (to_address or "").strip()
     try:
         wk.validate_doge_address(to_address)
@@ -336,7 +340,10 @@ def build(rpc, to_address, amount, fee_per_kb=None, subtract_fee=False, send_max
     if not (MIN_FEE_PER_KB <= fee_per_kb <= MAX_FEE_PER_KB):
         raise WalletError("Fee rate must be between " + str(MIN_FEE_PER_KB) + " and " + str(MAX_FEE_PER_KB) + " DOGE/kB")
 
-    utxos = [u for u in _our_utxos(rpc, state) if u["confirmations"] > 0]
+    if source == "trezor":
+        utxos = [u for u in _our_utxos(rpc, state) if u["confirmations"] > 0]
+    else:
+        utxos = [u for u in _node_utxos(rpc) if u["confirmations"] > 0]
     if not utxos:
         raise WalletError("No confirmed coins to spend")
     utxos.sort(key=lambda u: Decimal(u["amount"]), reverse=True)
@@ -385,7 +392,12 @@ def build(rpc, to_address, amount, fee_per_kb=None, subtract_fee=False, send_max
     outputs = [{"address": to_address, "amount": _koinu(amount), "script_type": "PAYTOADDRESS"}]
     rpc_outputs = {to_address: float(_q(amount))}
     change_info = None
-    if change > 0:
+    if change > 0 and source == "node":
+        caddr = rpc("getrawchangeaddress")
+        change_info = {"address": caddr, "index": None, "amount": _s(change)}
+        outputs.append({"address": caddr, "amount": _koinu(change), "script_type": "PAYTOADDRESS"})
+        rpc_outputs[caddr] = float(_q(change))
+    elif change > 0:
         used = _used_addresses(rpc)
         cidx = next((i for i, a in enumerate(state["addresses"]["1"]) if a not in used), None)
         if cidx is None:
@@ -398,17 +410,18 @@ def build(rpc, to_address, amount, fee_per_kb=None, subtract_fee=False, send_max
     inputs = []
     ref_txs = {}
     for u in chosen:
-        inputs.append({
-            "address_n": wk.bip44_path(state["account"], u["change"], u["index"]),
-            "prev_hash": u["txid"], "prev_index": u["vout"], "amount": _koinu(u["amount"]),
-            "script_type": "SPENDADDRESS", "address": u["address"],
-        })
-        if u["txid"] not in ref_txs:
-            ref_txs[u["txid"]] = _ref_tx(rpc, u["txid"])
+        inp = {"prev_hash": u["txid"], "prev_index": u["vout"], "amount": _koinu(u["amount"]),
+               "script_type": "SPENDADDRESS", "address": u["address"]}
+        if source == "trezor":
+            inp["address_n"] = wk.bip44_path(state["account"], u["change"], u["index"])
+            if u["txid"] not in ref_txs:
+                ref_txs[u["txid"]] = _ref_tx(rpc, u["txid"])
+        inputs.append(inp)
 
     unsigned = rpc("createrawtransaction", [[{"txid": u["txid"], "vout": u["vout"]} for u in chosen], rpc_outputs])
     return {
         "coin": "Dogecoin",
+        "source": source,
         "inputs": inputs,
         "outputs": outputs,
         "refTxs": list(ref_txs.values()),
@@ -435,8 +448,14 @@ def decode(rpc, hexstr):
     outs = []
     for o in d["vout"]:
         addrs = o.get("scriptPubKey", {}).get("addresses", [])
-        outs.append({"n": o["n"], "value": _s(o["value"]), "address": addrs[0] if addrs else None,
-                     "mine": bool(addrs and addrs[0] in amap)})
+        addr = addrs[0] if addrs else None
+        mine = bool(addr and addr in amap)
+        if addr and not mine:
+            try:
+                mine = bool(rpc("validateaddress", [addr]).get("ismine"))
+            except Exception:  # noqa: BLE001
+                mine = False
+        outs.append({"n": o["n"], "value": _s(o["value"]), "address": addr, "mine": mine})
     signed = all(v.get("scriptSig", {}).get("hex") for v in d["vin"])
     return {"txid": d["txid"], "size": d.get("size"), "signed": signed,
             "inputs": [{"txid": v["txid"], "vout": v["vout"]} for v in d["vin"]], "outputs": outs}
@@ -451,3 +470,186 @@ def broadcast(rpc, hexstr):
     except Exception as exc:  # noqa: BLE001
         raise WalletError("Node rejected the transaction: " + str(exc))
     return {"txid": txid}
+
+
+# --- node wallet (keys in the node's encrypted wallet.dat) -------------------
+#
+# Second signing source. Opt-in, and only usable once wallet.dat is
+# encrypted. The passphrase is never stored: it is sent with the sign
+# request, the wallet is unlocked for a few seconds, the node signs with
+# signrawtransaction, and the wallet is locked again in a finally block.
+
+NODE_FILE = os.path.join(STATE_DIR, "node.json")
+NODE_LABEL = "nodewallet"
+UNLOCK_SECONDS = 20
+
+
+def _node_cfg():
+    try:
+        with open(NODE_FILE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {"enabled": False}
+
+
+def _save_node_cfg(cfg):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = NODE_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(cfg, fh)
+    os.replace(tmp, NODE_FILE)
+
+
+def node_status(rpc):
+    cfg = _node_cfg()
+    out = {"enabled": bool(cfg.get("enabled")), "encrypted": None, "unlocked": False}
+    try:
+        info = rpc("getwalletinfo")
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = "node unavailable: " + str(exc)
+        return out
+    out["encrypted"] = "unlocked_until" in info
+    out["unlocked"] = bool(info.get("unlocked_until", 0))
+    bal = _q(info.get("balance", 0))
+    unconf = _q(info.get("unconfirmed_balance", 0))
+    out["balance"] = {"confirmed": _s(bal), "unconfirmed": _s(unconf)}
+    out["keypool"] = info.get("keypoolsize")
+    # Spendable funds in a wallet the user has not opted into => warn.
+    out["hot_balance_warning"] = (bal + unconf) > 0 and not out["enabled"]
+    if out["enabled"] and out["encrypted"]:
+        try:
+            out["receive"] = node_receive(rpc)
+            out["transactions"] = _node_history(rpc)
+            out["utxos"] = _node_utxos(rpc)
+        except WalletError as exc:
+            out["error"] = str(exc)
+    return out
+
+
+def _node_utxos(rpc):
+    utxos = []
+    for u in rpc("listunspent", [0, 9999999]):
+        if not u.get("spendable"):
+            continue
+        utxos.append({"txid": u["txid"], "vout": u["vout"], "address": u.get("address"),
+                      "amount": _s(u["amount"]), "confirmations": u.get("confirmations", 0),
+                      "change": None, "index": None})
+    return utxos
+
+
+def _node_history(rpc):
+    rows = rpc("listtransactions", ["*", 200, 0, False])
+    by_txid = {}
+    for r in rows:
+        if r.get("involvesWatchonly"):
+            continue
+        t = by_txid.setdefault(r["txid"], {"txid": r["txid"], "time": r.get("time"), "confirmations": r.get("confirmations", 0),
+                                           "received": Decimal(0), "sent": Decimal(0), "fee": Decimal(0)})
+        amt = _q(r.get("amount", 0))
+        if r.get("category") == "receive":
+            t["received"] += amt
+        elif r.get("category") == "send":
+            t["sent"] += -amt
+            if r.get("fee") is not None:
+                t["fee"] = -_q(r["fee"])
+    return [{"txid": t["txid"], "time": t["time"], "confirmations": t["confirmations"],
+             "net": _s(t["received"] - t["sent"]), "fee": _s(t["fee"])}
+            for t in sorted(by_txid.values(), key=lambda t: (t["time"] or 0), reverse=True)]
+
+
+def node_receive(rpc):
+    """Reuse the newest unused labelled address; otherwise mint one."""
+    try:
+        for a in rpc("getaddressesbyaccount", [NODE_LABEL]):
+            if not rpc("getreceivedbyaddress", [a, 0]):
+                return {"address": a, "path": "node wallet"}
+    except Exception:  # noqa: BLE001
+        pass
+    return {"address": rpc("getnewaddress", [NODE_LABEL]), "path": "node wallet"}
+
+
+def _check_passphrase(p):
+    if not isinstance(p, str) or len(p) < 10:
+        raise WalletError("Passphrase must be at least 10 characters")
+    if len(p) > 1024:
+        raise WalletError("Passphrase too long")
+
+
+def node_enable(rpc):
+    ns = node_status(rpc)
+    if not ns.get("encrypted"):
+        raise WalletError("Encrypt the node wallet first")
+    _save_node_cfg({"enabled": True, "since": int(time.time())})
+
+
+def node_disable(rpc):
+    _save_node_cfg({"enabled": False})
+
+
+def node_encrypt(rpc, passphrase, confirm):
+    """encryptwallet: Dogecoin Core 1.14 stops the daemon afterwards and
+    docker restarts it. The UI shows the node as restarting."""
+    ns = node_status(rpc)
+    if ns.get("encrypted"):
+        raise WalletError("Wallet is already encrypted")
+    _check_passphrase(passphrase)
+    if passphrase != confirm:
+        raise WalletError("Passphrases do not match")
+    try:
+        rpc("encryptwallet", [passphrase], timeout=120)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        # The daemon exits during this call, which can surface as a connection error.
+        if "unlocked_until" in msg or "already encrypted" in msg:
+            raise WalletError("Wallet is already encrypted")
+    _save_node_cfg({"enabled": True, "since": int(time.time())})
+    return {"restarting": True}
+
+
+def node_sign(rpc, unsigned_hex, passphrase):
+    ns = node_status(rpc)
+    if not ns.get("enabled"):
+        raise WalletError("Node wallet mode is not enabled")
+    if not ns.get("encrypted"):
+        raise WalletError("Node wallet is not encrypted; refusing to sign")
+    if not isinstance(passphrase, str) or not passphrase:
+        raise WalletError("Passphrase required")
+    unsigned_hex = (unsigned_hex or "").strip()
+    if not unsigned_hex or any(c not in "0123456789abcdefABCDEF" for c in unsigned_hex):
+        raise WalletError("Not a hex transaction")
+    try:
+        rpc("walletpassphrase", [passphrase, UNLOCK_SECONDS])
+    except Exception as exc:  # noqa: BLE001
+        raise WalletError("Wrong passphrase" if "incorrect" in str(exc).lower() else "Unlock failed: " + str(exc))
+    try:
+        res = rpc("signrawtransaction", [unsigned_hex], timeout=60)
+    except Exception as exc:  # noqa: BLE001
+        raise WalletError("Signing failed: " + str(exc))
+    finally:
+        try:
+            rpc("walletlock")
+        except Exception:  # noqa: BLE001
+            pass
+    if not res.get("complete"):
+        raise WalletError("Node could not fully sign this transaction (inputs not owned by the node wallet?)")
+    return {"hex": res["hex"]}
+
+
+def node_backup(rpc):
+    """backupwallet writes inside the dogecoind container; the web container
+    sees the same directory read-only at /backups for download."""
+    name = "wallet-" + time.strftime("%Y%m%d-%H%M%S") + ".dat"
+    try:
+        rpc("backupwallet", ["/data/backups/" + name])
+    except Exception as exc:  # noqa: BLE001
+        raise WalletError("Backup failed: " + str(exc))
+    return {"file": name}
+
+
+def backup_path(name):
+    if not name or "/" in name or not name.startswith("wallet-") or not name.endswith(".dat"):
+        raise WalletError("bad backup name")
+    path = os.path.join(os.environ.get("BACKUP_DIR", "/backups"), name)
+    if not os.path.isfile(path):
+        raise WalletError("backup not found")
+    return path

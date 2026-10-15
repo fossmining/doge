@@ -22,7 +22,9 @@ services:
   dogecoind:
     image: python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
     user: "1000:1000"
-    restart: on-failure
+    # unless-stopped (not on-failure): encryptwallet makes dogecoind exit
+    # cleanly and it must come back on its own.
+    restart: unless-stopped
     init: true
     stop_grace_period: 3m
     depends_on:
@@ -82,4 +84,6 @@ services:
       - ${APP_DATA_DIR}/walletkeys.py:/app/walletkeys.py:ro
       # Only the linked account's PUBLIC key and derived addresses live here.
       - ${APP_DATA_DIR}/data/walletui:/state
+      # Encrypted wallet.dat backups written by dogecoind, served for download.
+      - ${APP_DATA_DIR}/data/dogecoin/backups:/backups:ro
     command: ["python3", "-u", "/app/dashboard.py"]
