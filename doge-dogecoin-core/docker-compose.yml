@@ -35,7 +35,8 @@ services:
     volumes:
       - ${APP_DATA_DIR}/data/bin:/opt/dogecoin:ro
       - ${APP_DATA_DIR}/data/dogecoin:/data
-    entrypoint: ["/opt/dogecoin/1.14.9/bin/dogecoind"]
+    # sh -c so the Tor arguments (built in exports.sh) expand into separate flags.
+    entrypoint: ["/bin/sh", "-c", "exec /opt/dogecoin/1.14.9/bin/dogecoind \"$$@\" ${APP_DOGECOIN_TOR_ARGS}", "--"]
     command:
       - -datadir=/data
       - -printtoconsole
@@ -54,9 +55,26 @@ services:
       - -zmqpubhashblock=tcp://0.0.0.0:${APP_DOGECOIN_ZMQ_HASHBLOCK_PORT}
       - -zmqpubrawblock=tcp://0.0.0.0:${APP_DOGECOIN_ZMQ_RAWBLOCK_PORT}
       - -zmqpubrawtx=tcp://0.0.0.0:${APP_DOGECOIN_ZMQ_RAWTX_PORT}
+    networks:
+      default:
+        ipv4_address: ${APP_DOGECOIN_NODE_IP}
     ports:
-      # Dogecoin P2P. Forward this on your router for inbound peers.
+      # Dogecoin P2P. Forward this on your router for inbound clearnet peers
+      # (not needed for .onion peers; unused in tor-only mode).
       - "22556:22556/tcp"
+
+  tor:
+    image: ghcr.io/getumbrel/tor:0.4.9.11@sha256:e382b8629c0dfef6ceb396b062622d4e4e955b19d6f16b883fd2c0723ad5671a
+    user: "1000:1000"
+    restart: on-failure
+    volumes:
+      - ${APP_DATA_DIR}/torrc:/etc/tor/torrc:ro
+      - ${TOR_DATA_DIR}:/data
+    environment:
+      HOME: "/tmp"
+    networks:
+      default:
+        ipv4_address: ${APP_DOGECOIN_TOR_PROXY_IP}
 
   web:
     image: python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
@@ -76,6 +94,9 @@ services:
       ZMQ_RAWBLOCK_PORT: ${APP_DOGECOIN_ZMQ_RAWBLOCK_PORT}
       ZMQ_RAWTX_PORT: ${APP_DOGECOIN_ZMQ_RAWTX_PORT}
       DEVICE_DOMAIN_NAME: ${DEVICE_DOMAIN_NAME}
+      P2P_ONION: ${APP_DOGECOIN_P2P_HIDDEN_SERVICE}
+      RPC_ONION: ${APP_DOGECOIN_RPC_HIDDEN_SERVICE}
+      TOR_MODE: ${APP_DOGECOIN_TOR_MODE}
     volumes:
       - ${APP_DATA_DIR}/dashboard.py:/app/dashboard.py:ro
       - ${APP_DATA_DIR}/wallet.py:/app/wallet.py:ro

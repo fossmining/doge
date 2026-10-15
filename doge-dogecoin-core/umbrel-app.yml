@@ -4,7 +4,7 @@ storage:
   dataRoot: data
 category: crypto
 name: Dogecoin Core
-version: "1.18.0"
+version: "1.19.0"
 tagline: Dogecoin full node with a watch-only Trezor wallet
 icon: https://raw.githubusercontent.com/dogecoin/dogecoin/master/share/pixmaps/dogecoin256.png
 description: >-
@@ -44,18 +44,22 @@ description: >-
   data, MyDoge signs in its popup, the node broadcasts.
 
 
+  Tor is built in, like the Umbrel Bitcoin and Monero apps: all outbound
+  peer connections go through a private Tor container, the node is reachable
+  on its own .onion (shown on the dashboard, with an RPC .onion for remote
+  wallets), and a one-click "Tor-only" mode restricts it to .onion peers so
+  no clearnet peer can tie your IP to the transactions you broadcast.
+
+
   Initial sync downloads the full Dogecoin blockchain (well over 100 GB) and
   can take a day or more. An SSD is strongly recommended. Forward TCP port
   22556 on your router if you want inbound peers.
 releaseNotes: >-
-  Security hardening after an independent code review: Trezor Connect now
-  runs in an isolated signer window (the wallet page loads no third-party
-  code); the node remembers every reviewed transaction and refuses to
-  broadcast or sign anything else; backups and backup downloads are refused
-  on an unencrypted wallet; recipient/change collisions, bare-multisig
-  "mine" spoofing, MyDoge address injection, failed-import phantom
-  accounts and float precision loss are fixed; node unlock window reduced
-  to 5 s and serialized.
+  Tor: outbound connections now go through a bundled Tor container, the
+  node gets P2P and RPC hidden services, and the dashboard shows Tor status
+  with a Tor-only switch. The node now has a fixed address on the Umbrel
+  network (10.21.21.231); apps that connected by container name keep
+  working.
 
 developer: fossmining (node: Dogecoin Core developers)
 website: https://dogecoin.com

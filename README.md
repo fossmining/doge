@@ -1,6 +1,6 @@
 # Dogecoin Umbrel App Store
 
-Community app store for umbrelOS with one app: **Dogecoin Core 1.14.9 + watch-only Trezor wallet** (`doge-dogecoin-core`, app version 1.17.0).
+Community app store for umbrelOS with one app: **Dogecoin Core 1.14.9 + watch-only Trezor wallet** (`doge-dogecoin-core`, app version 1.19.0).
 
 ## What the app does
 
@@ -77,6 +77,23 @@ Dogecoin blockchain itself.
 
 All containers use `python:3.12.11-slim-bookworm` pinned by multi-arch digest, so no
 third-party Dogecoin image is trusted.
+
+## Tor
+
+Same pattern as the official Bitcoin and Monero apps: a `tor` container (Umbrel's image) with
+`torrc.template` defining two hidden services, and `dogecoind` started with
+`-proxy=<tor>:9050 -onion=<tor>:9050 -discover=0 -externalip=<p2p onion>`. `hooks/pre-start`
+waits for the hidden-service hostname on first start.
+
+| | |
+|---|---|
+| Default mode | all outbound through Tor; inbound on the .onion **and** on clearnet `22556` |
+| Tor-only | adds `-onlynet=onion`; no clearnet peers at all (fewer peers, strongest privacy) |
+| Switch | dashboard → *Privacy (Tor)* → button, then restart the app (`data/walletui/tor.json`) |
+| Onions | shown on the dashboard: P2P (`addnode` for other nodes) and RPC (remote wallets) |
+
+Because Tor needs an IP as hidden-service target, `dogecoind` now has a fixed address
+`10.21.21.231` and the Tor container `10.21.21.232` on the Umbrel network.
 
 ## Install
 
