@@ -78,11 +78,8 @@ services:
       DEVICE_DOMAIN_NAME: ${DEVICE_DOMAIN_NAME}
     volumes:
       - ${APP_DATA_DIR}/dashboard.py:/app/dashboard.py:ro
-      - ${APP_DATA_DIR}/dashboard.js:/app/dashboard.js:ro
       - ${APP_DATA_DIR}/wallet.py:/app/wallet.py:ro
       - ${APP_DATA_DIR}/walletkeys.py:/app/walletkeys.py:ro
-      - ${APP_DATA_DIR}/wallet.html:/app/wallet.html:ro
-      - ${APP_DATA_DIR}/wallet.js:/app/wallet.js:ro
       # Only the linked account's PUBLIC key and derived addresses live here.
       - ${APP_DATA_DIR}/data/walletui:/state
     command: ["python3", "-u", "/app/dashboard.py"]
